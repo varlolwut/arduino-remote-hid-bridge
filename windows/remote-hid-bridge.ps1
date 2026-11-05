@@ -31,6 +31,7 @@ if ($autoDetectPort) {
 
 $source = @"
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -143,13 +144,33 @@ public static class RemoteHidBridge
 
     private static readonly Dictionary<uint, byte> KeyMap = CreateKeyMap();
     private static readonly HashSet<uint> PressedKeys = new HashSet<uint>();
+    private static readonly HashSet<uint> ReleasingKeys = new HashSet<uint>();
     private static readonly Dictionary<byte, int> PendingKeyDown = new Dictionary<byte, int>();
     private static readonly Dictionary<byte, int> PendingKeyUp = new Dictionary<byte, int>();
     private static readonly int[] PendingMouseDown = new int[4];
     private static readonly int[] PendingMouseUp = new int[4];
     private static readonly object SerialSync = new object();
     private static readonly object StateSync = new object();
+    private static readonly object LogSync = new object();
+    private static readonly string LogPath = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "RemoteHidBridge",
+        "bridge.log");
 
+    private sealed class BridgeCommand
+    {
+        public string Text;
+        public DateTime Due;
+
+        public BridgeCommand(string text, int delayMilliseconds)
+        {
+            Text = text;
+            Due = DateTime.UtcNow.AddMilliseconds(delayMilliseconds);
+        }
+    }
+
+    private static readonly BlockingCollection<BridgeCommand> CommandQueue = new BlockingCollection<BridgeCommand>();
+    private static Thread commandWorker;
     private static SerialPort serial;
     private static string serialPortName;
     private static int serialBaudRate;
@@ -191,18 +212,23 @@ public static class RemoteHidBridge
 
         try
         {
+            Log("Starting bridge on " + serialPortName + (parsecMode ? " in Parsec mode" : " in Standard mode"));
             OpenSerial(false);
             Thread.Sleep(2000);
             Send("R");
             GetCursorPos(out lastMousePoint);
             InitializeTray(iconPath);
             SetConnectionStatus("Connected");
+            running = true;
+
+            commandWorker = new Thread(CommandWorker);
+            commandWorker.IsBackground = true;
+            commandWorker.Start();
 
             keyboardHookHandle = InstallHook(WH_KEYBOARD_LL, keyboardHookCallback);
             mouseHookHandle = InstallHook(WH_MOUSE_LL, mouseHookCallback);
 
             Console.CancelKeyPress += ConsoleCancel;
-            running = true;
             heartbeatTimer = new System.Threading.Timer(Heartbeat, null, 500, 500);
 
             Console.WriteLine("Remote HID bridge is running on " + portName + ".");
@@ -234,6 +260,7 @@ public static class RemoteHidBridge
         finally
         {
             running = false;
+            CommandQueue.CompleteAdding();
 
             if (heartbeatTimer != null)
             {
@@ -250,6 +277,12 @@ public static class RemoteHidBridge
             {
                 UnhookWindowsHookEx(mouseHookHandle);
                 mouseHookHandle = IntPtr.Zero;
+            }
+
+            if (commandWorker != null)
+            {
+                commandWorker.Join(2000);
+                commandWorker = null;
             }
 
             if (trayIcon != null)
@@ -276,12 +309,14 @@ public static class RemoteHidBridge
                 catch (Exception error)
                 {
                     Console.WriteLine("Could not send final release: " + error.Message);
+                    Log("Final release failed: " + error.Message);
                 }
                 finally
                 {
                     CloseSerial();
                 }
             }
+            Log("Bridge stopped");
         }
     }
 
@@ -310,6 +345,30 @@ public static class RemoteHidBridge
         trayIcon.Visible = true;
     }
 
+    private static void Log(string message)
+    {
+        try
+        {
+            lock (LogSync)
+            {
+                string directory = System.IO.Path.GetDirectoryName(LogPath);
+                System.IO.Directory.CreateDirectory(directory);
+                if (System.IO.File.Exists(LogPath)
+                    && new System.IO.FileInfo(LogPath).Length >= 256 * 1024)
+                {
+                    System.IO.File.Copy(LogPath, LogPath + ".old", true);
+                    System.IO.File.WriteAllText(LogPath, string.Empty);
+                }
+                System.IO.File.AppendAllText(
+                    LogPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + message + Environment.NewLine);
+            }
+        }
+        catch
+        {
+        }
+    }
+
     private static void SetConnectionStatus(string status)
     {
         inputReady = status == "Connected";
@@ -320,6 +379,7 @@ public static class RemoteHidBridge
 
         trayStatus = status;
         Console.WriteLine("Status: " + status);
+        Log("Status: " + status + " (" + serialPortName + ")");
         UpdateStatusText();
     }
 
@@ -345,6 +405,7 @@ public static class RemoteHidBridge
             ReleaseControls();
         }
         pauseMenuItem.Text = inputPaused ? "Resume input" : "Pause input";
+        Log(inputPaused ? "Input paused" : "Input resumed");
         UpdateStatusText();
     }
 
@@ -391,14 +452,7 @@ public static class RemoteHidBridge
 
     private static void ReleaseControls()
     {
-        try
-        {
-            Send("R");
-        }
-        catch (Exception error)
-        {
-            HandleConnectionError(error);
-        }
+        EnqueueCommand("R", 0);
 
         lock (StateSync)
         {
@@ -409,6 +463,7 @@ public static class RemoteHidBridge
     private static void ResetInputState()
     {
         PressedKeys.Clear();
+        ReleasingKeys.Clear();
         PendingKeyDown.Clear();
         PendingKeyUp.Clear();
         Array.Clear(PendingMouseDown, 0, PendingMouseDown.Length);
@@ -505,6 +560,7 @@ public static class RemoteHidBridge
         if (reportError)
         {
             Console.WriteLine("Connection lost: " + error.Message);
+            Log("Connection lost: " + error.Message);
         }
     }
 
@@ -589,13 +645,6 @@ public static class RemoteHidBridge
                 bool isInjected = (data.flags & LLKHF_INJECTED) != 0;
                 bool isMapped = KeyMap.TryGetValue(data.vkCode, out hidCode);
 
-                if (parsecMode)
-                {
-                    Console.WriteLine("K vk=" + data.vkCode + " scan=" + data.scanCode
-                        + " flags=" + data.flags + " msg=" + message
-                        + " hid=" + hidCode + " mapped=" + isMapped);
-                }
-
                 if (isMapped && (isInjected || parsecMode))
                 {
                     if (!inputReady)
@@ -614,46 +663,49 @@ public static class RemoteHidBridge
                     {
                         if (isDown && ConsumePending(PendingKeyDown, hidCode))
                         {
-                            Console.WriteLine("K echo down passed: " + hidCode);
                             return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
                         }
                         if (isUp && ConsumePending(PendingKeyUp, hidCode))
                         {
-                            Console.WriteLine("K echo up passed: " + hidCode);
+                            if (ReleasingKeys.Remove(data.vkCode))
+                            {
+                                PressedKeys.Remove(data.vkCode);
+                            }
                             return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
                         }
                         if (isDown && PressedKeys.Contains(data.vkCode))
                         {
-                            Console.WriteLine("K repeat passed: " + hidCode);
                             return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
                         }
                     }
 
-                    try
+                    if (isDown)
                     {
-                        if (isDown)
+                        bool isRepress = ReleasingKeys.Remove(data.vkCode);
+                        if (PressedKeys.Add(data.vkCode) || isRepress)
                         {
-                            if (PressedKeys.Add(data.vkCode))
+                            AddPending(PendingKeyDown, hidCode);
+                            EnqueueCommand("D " + hidCode, 0);
+                        }
+                    }
+                    else if (isUp)
+                    {
+                        if (parsecMode)
+                        {
+                            if (PressedKeys.Contains(data.vkCode) && !ReleasingKeys.Add(data.vkCode))
                             {
-                                AddPending(PendingKeyDown, hidCode);
-                                Send("D " + hidCode);
+                                return (IntPtr)1;
                             }
                         }
-                        else if (isUp)
+                        else
                         {
                             PressedKeys.Remove(data.vkCode);
-                            Thread.Sleep(80);
-                            AddPending(PendingKeyUp, hidCode);
-                            Send("U " + hidCode);
                         }
+                        AddPending(PendingKeyUp, hidCode);
+                        EnqueueCommand("U " + hidCode, 80);
+                    }
 
-                        return (IntPtr)1;
-                    }
-                    catch (Exception error)
-                    {
-                        HandleConnectionError(error);
-                        return (IntPtr)1;
-                    }
+                    return (IntPtr)1;
                 }
             }
         }
@@ -713,42 +765,30 @@ public static class RemoteHidBridge
                         }
                     }
 
-                    try
+                    if (button != 0)
                     {
-                        if (button != 0)
+                        if (parsecMode)
                         {
-                            if (isUp)
-                            {
-                                Thread.Sleep(80);
-                            }
-                            if (parsecMode)
-                            {
-                                int[] pending = isDown ? PendingMouseDown : PendingMouseUp;
-                                pending[button]++;
-                            }
-                            Send("B " + button + (isDown ? " 1" : " 0"));
-                            return (IntPtr)1;
+                            int[] pending = isDown ? PendingMouseDown : PendingMouseUp;
+                            pending[button]++;
                         }
+                        EnqueueCommand("B " + button + (isDown ? " 1" : " 0"), isUp ? 80 : 0);
+                        return (IntPtr)1;
+                    }
 
-                        short delta = (short)((data.mouseData >> 16) & 0xFFFF);
-                        wheelRemainder += delta;
-                        int ticks = wheelRemainder / 120;
-                        wheelRemainder %= 120;
-                        if (ticks != 0)
-                        {
-                            if (parsecMode)
-                            {
-                                pendingWheelEcho += Math.Abs(ticks);
-                            }
-                            Send("V " + ticks);
-                        }
-                        return (IntPtr)1;
-                    }
-                    catch (Exception error)
+                    short delta = (short)((data.mouseData >> 16) & 0xFFFF);
+                    wheelRemainder += delta;
+                    int ticks = wheelRemainder / 120;
+                    wheelRemainder %= 120;
+                    if (ticks != 0)
                     {
-                        HandleConnectionError(error);
-                        return (IntPtr)1;
+                        if (parsecMode)
+                        {
+                            pendingWheelEcho += Math.Abs(ticks);
+                        }
+                        EnqueueCommand("V " + ticks, 0);
                     }
+                    return (IntPtr)1;
                 }
             }
         }
@@ -861,6 +901,63 @@ public static class RemoteHidBridge
         finally
         {
             Interlocked.Exchange(ref heartbeatActive, 0);
+        }
+    }
+
+    private static void EnqueueCommand(string command, int delayMilliseconds)
+    {
+        if (!running)
+        {
+            return;
+        }
+
+        try
+        {
+            CommandQueue.Add(new BridgeCommand(command, delayMilliseconds));
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private static void CommandWorker()
+    {
+        try
+        {
+            foreach (BridgeCommand command in CommandQueue.GetConsumingEnumerable())
+            {
+                if (!running)
+                {
+                    break;
+                }
+                if (!inputReady)
+                {
+                    continue;
+                }
+
+                TimeSpan delay = command.Due - DateTime.UtcNow;
+                if (delay.TotalMilliseconds > 0)
+                {
+                    Thread.Sleep((int)Math.Ceiling(delay.TotalMilliseconds));
+                }
+                if (!running || !inputReady)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Send(command.Text);
+                }
+                catch (Exception error)
+                {
+                    HandleConnectionError(error);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            HandleConnectionError(error);
         }
     }
 

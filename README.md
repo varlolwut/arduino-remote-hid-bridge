@@ -26,6 +26,8 @@ windows\start-parsec-hid-bridge.cmd COM7
 
 The tray menu shows the connection state, COM port and mode. **Pause input** releases all controls and stops forwarding until resumed; **Reconnect** detects the Arduino COM port again and restarts the connection. **Hide/Show console** controls the log window. **Release controls** is also available on double-click. If Arduino disconnects, input passes directly to Windows until the bridge reconnects.
 
+Input hooks only update state and enqueue commands; serial writes and delays run on a separate thread so they cannot block Windows input. Individual keys are not logged. Connection, pause and error events are stored in `%LOCALAPPDATA%\RemoteHidBridge\bridge.log` (rotated at 256 KB).
+
 ## Stop the bridge
 
 - **Ctrl+Alt+F12** — release all controls and close the bridge.
