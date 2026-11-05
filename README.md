@@ -10,10 +10,11 @@ Remote keyboard and mouse control for Windows through an Arduino Pro Micro (ATme
 
 ## Setup
 
+> **Important: run the bridge as administrator.** The CMD launchers request elevation automatically; approve the UAC prompt, otherwise input may not reach elevated applications.
+
 1. Open `firmware/RemoteHid/RemoteHid.ino` in Arduino IDE.
 2. Select the board matching your Pro Micro and its COM port, then upload the sketch.
-3. Start `windows/start-parsec-hid-bridge.cmd` for Parsec or Moonlight. Use `windows/start-hid-bridge.cmd` for RustDesk.
-4. Approve the administrator prompt. Administrator rights are required when the controlled application runs elevated.
+3. Start the appropriate CMD launcher from `windows/`.
 
 The COM port is detected automatically. To specify it explicitly:
 
@@ -32,5 +33,5 @@ Keep the bridge window open while playing. Press `Ctrl+C` in that window to stop
 
 - `firmware/` — turns the Pro Micro into a USB keyboard and mouse.
 - `windows/remote-hid-bridge.ps1` — captures remote input and forwards it to the Arduino.
-- `windows/start-*.cmd` — launch the bridge in the appropriate mode with administrator rights.
-- `windows/test-*.cmd` — optional direct-input diagnostics.
+- `windows/start-hid-bridge.cmd` — standard mode for RustDesk; captures injected remote input.
+- `windows/start-parsec-hid-bridge.cmd` — Parsec/Moonlight mode; captures virtual HID input and filters out Arduino echo.
