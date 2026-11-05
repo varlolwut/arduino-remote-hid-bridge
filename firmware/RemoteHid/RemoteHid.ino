@@ -1,4 +1,5 @@
 #include <HID.h>
+#include "OledDisplay.h"
 
 const unsigned long LINK_TIMEOUT_MS = 2000;
 const uint8_t COMMAND_BUFFER_SIZE = 24;
@@ -55,9 +56,11 @@ public:
 };
 
 HidDescriptorRegistration hidDescriptorRegistration;
+OledDisplay display;
 char commandBuffer[COMMAND_BUFFER_SIZE];
 uint8_t commandLength = 0;
 unsigned long lastCommandAt = 0;
+bool hasLink = false;
 bool keysMayBePressed = false;
 bool mouseButtonsMayBePressed = false;
 
@@ -210,6 +213,7 @@ void releaseControls() {
 
   keysMayBePressed = false;
   mouseButtonsMayBePressed = false;
+  display.setActivity("RELEASE ALL");
 }
 
 bool parseLong(const char *text, long *value, char **end) {
@@ -219,12 +223,14 @@ bool parseLong(const char *text, long *value, char **end) {
 
 void handleCommand(const char *command) {
   if (strcmp(command, "H") == 0) {
+    hasLink = true;
     lastCommandAt = millis();
     return;
   }
 
   if (strcmp(command, "R") == 0) {
     releaseControls();
+    hasLink = true;
     lastCommandAt = millis();
     return;
   }
@@ -274,11 +280,25 @@ void handleCommand(const char *command) {
     return;
   }
 
+  if (command[0] == 'D') {
+    display.setActivity("KEY DOWN");
+  } else if (command[0] == 'U') {
+    display.setActivity("KEY UP");
+  } else if (command[0] == 'B') {
+    display.setActivity("MOUSE BUTTON");
+  } else if (command[0] == 'V') {
+    display.setActivity("WHEEL");
+  } else if (command[0] == 'M') {
+    display.setActivity("MOUSE MOVE");
+  }
+
+  hasLink = true;
   lastCommandAt = millis();
 }
 
 void setup() {
   Serial.begin(115200);
+  display.begin();
   lastCommandAt = millis();
 }
 
@@ -301,7 +321,9 @@ void loop() {
     }
   }
 
-  if ((keysMayBePressed || mouseButtonsMayBePressed) && millis() - lastCommandAt > LINK_TIMEOUT_MS) {
+  bool linkActive = hasLink && millis() - lastCommandAt <= LINK_TIMEOUT_MS;
+  if ((keysMayBePressed || mouseButtonsMayBePressed) && hasLink && !linkActive) {
     releaseControls();
   }
+  display.update(hasLink, linkActive);
 }

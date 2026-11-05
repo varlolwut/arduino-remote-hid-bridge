@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#101E31"/>
+      <stop offset="1" stop-color="#070B14"/>
+    </linearGradient>
+    <linearGradient id="iconBg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14243A"/>
+      <stop offset="1" stop-color="#080D18"/>
+    </linearGradient>
+    <linearGradient id="link" x1="210" y1="130" x2="310" y2="220" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#32D5FF"/>
+      <stop offset="1" stop-color="#8B6CFF"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0" cy="0" r="1" gradientTransform="translate(1110 80) rotate(130) scale(560)">
+      <stop stop-color="#713EFF" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#713EFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#halo)"/>
+  <g transform="translate(66 64)">
+    <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#iconBg)"/>
+    <rect x="24" y="24" width="464" height="464" rx="104" fill="none" stroke="#263A55" stroke-width="4"/>
+    <path d="M207 213C226 119 286 119 305 213" fill="none" stroke="url(#link)" stroke-width="18" stroke-linecap="round"/>
+    <circle cx="207" cy="213" r="15" fill="#32D5FF"/>
+    <circle cx="305" cy="213" r="15" fill="#8B6CFF"/>
+    <rect x="62" y="181" width="151" height="132" rx="25" fill="#15263C" stroke="#42617F" stroke-width="7"/>
+    <path d="M116 337h43M137 313v24" stroke="#42617F" stroke-width="12" stroke-linecap="round"/>
+    <path d="M119 211l17 68 17-24 27 26 14-15-27-26 25-16z" fill="#F2F8FF"/>
+    <rect x="299" y="181" width="151" height="151" rx="34" fill="#211E43" stroke="#8B6CFF" stroke-width="7"/>
+    <path d="M321 207h107" stroke="#B5A5FF" stroke-opacity=".55" stroke-width="7" stroke-linecap="round"/>
+    <text x="374" y="286" fill="#F5F2FF" font-family="Segoe UI,Arial,sans-serif" font-size="53" font-weight="700" text-anchor="middle">HID</text>
+    <path d="M166 388h180" stroke="#263A55" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="194" cy="388" r="7" fill="#32D5FF"/>
+    <circle cx="318" cy="388" r="7" fill="#8B6CFF"/>
+  </g>
+  <text x="610" y="188" fill="#62DDFF" font-family="Segoe UI,Arial,sans-serif" font-size="25" font-weight="600" letter-spacing="6">ARDUINO PRO MICRO</text>
+  <text x="604" y="290" fill="#F4F8FF" font-family="Segoe UI,Arial,sans-serif" font-size="76" font-weight="700">Remote HID</text>
+  <text x="604" y="378" fill="#F4F8FF" font-family="Segoe UI,Arial,sans-serif" font-size="76" font-weight="700">Bridge</text>
+  <text x="610" y="444" fill="#91A5BE" font-family="Segoe UI,Arial,sans-serif" font-size="27">Remote input. Local USB keyboard and mouse.</text>
+  <rect x="610" y="490" width="163" height="48" rx="24" fill="#102C3D" stroke="#24516A"/>
+  <text x="691" y="522" fill="#65DEFF" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="600" text-anchor="middle">KEYBOARD</text>
+  <rect x="789" y="490" width="126" height="48" rx="24" fill="#211D40" stroke="#514487"/>
+  <text x="852" y="522" fill="#B7A8FF" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="600" text-anchor="middle">MOUSE</text>
+</svg>

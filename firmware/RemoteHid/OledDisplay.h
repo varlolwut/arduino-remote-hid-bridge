@@ -1,0 +1,174 @@
+#ifndef REMOTE_HID_OLED_DISPLAY_H
+#define REMOTE_HID_OLED_DISPLAY_H
+
+#include <Arduino.h>
+#include <Wire.h>
+
+const uint8_t OLED_DIGITS[] PROGMEM = {
+  0x3E, 0x51, 0x49, 0x45, 0x3E,
+  0x00, 0x42, 0x7F, 0x40, 0x00,
+  0x42, 0x61, 0x51, 0x49, 0x46,
+  0x21, 0x41, 0x45, 0x4B, 0x31,
+  0x18, 0x14, 0x12, 0x7F, 0x10,
+  0x27, 0x45, 0x45, 0x45, 0x39,
+  0x3C, 0x4A, 0x49, 0x49, 0x30,
+  0x01, 0x71, 0x09, 0x05, 0x03,
+  0x36, 0x49, 0x49, 0x49, 0x36,
+  0x06, 0x49, 0x49, 0x29, 0x1E
+};
+
+const uint8_t OLED_LETTERS[] PROGMEM = {
+  0x7E, 0x11, 0x11, 0x11, 0x7E,
+  0x7F, 0x49, 0x49, 0x49, 0x36,
+  0x3E, 0x41, 0x41, 0x41, 0x22,
+  0x7F, 0x41, 0x41, 0x22, 0x1C,
+  0x7F, 0x49, 0x49, 0x49, 0x41,
+  0x7F, 0x09, 0x09, 0x09, 0x01,
+  0x3E, 0x41, 0x49, 0x49, 0x7A,
+  0x7F, 0x08, 0x08, 0x08, 0x7F,
+  0x00, 0x41, 0x7F, 0x41, 0x00,
+  0x20, 0x40, 0x41, 0x3F, 0x01,
+  0x7F, 0x08, 0x14, 0x22, 0x41,
+  0x7F, 0x40, 0x40, 0x40, 0x40,
+  0x7F, 0x02, 0x0C, 0x02, 0x7F,
+  0x7F, 0x04, 0x08, 0x10, 0x7F,
+  0x3E, 0x41, 0x41, 0x41, 0x3E,
+  0x7F, 0x09, 0x09, 0x09, 0x06,
+  0x3E, 0x41, 0x51, 0x21, 0x5E,
+  0x7F, 0x09, 0x19, 0x29, 0x46,
+  0x46, 0x49, 0x49, 0x49, 0x31,
+  0x01, 0x01, 0x7F, 0x01, 0x01,
+  0x3F, 0x40, 0x40, 0x40, 0x3F,
+  0x1F, 0x20, 0x40, 0x20, 0x1F,
+  0x3F, 0x40, 0x38, 0x40, 0x3F,
+  0x63, 0x14, 0x08, 0x14, 0x63,
+  0x07, 0x08, 0x70, 0x08, 0x07,
+  0x61, 0x51, 0x49, 0x45, 0x43
+};
+
+class OledDisplay {
+public:
+  OledDisplay() : address_(0), linkState_(-1), activityDirty_(false) {
+    activity_[0] = '\0';
+  }
+
+  void begin() {
+    Wire.begin();
+    Wire.setClock(400000);
+    address_ = detect(0x3C) ? 0x3C : (detect(0x3D) ? 0x3D : 0);
+    if (address_ == 0) {
+      return;
+    }
+
+    static const uint8_t initialization[] PROGMEM = {
+      0xAE, 0xD5, 0x80, 0xA8, 0x1F, 0xD3, 0x00, 0x40,
+      0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x02,
+      0x81, 0x8F, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6,
+      0x2E, 0xAF
+    };
+    for (uint8_t i = 0; i < sizeof(initialization); i++) {
+      command(pgm_read_byte(&initialization[i]));
+    }
+
+    writeLine(0, "REMOTE HID");
+    writeLine(2, "HID READY");
+    setActivity("READY");
+  }
+
+  void setActivity(const char *activity) {
+    if (address_ == 0) {
+      return;
+    }
+    strncpy(activity_, activity, 16);
+    activity_[16] = '\0';
+    activityDirty_ = true;
+  }
+
+  void update(bool hasLink, bool linkActive) {
+    if (address_ == 0) {
+      return;
+    }
+
+    uint8_t state = !hasLink ? 0 : (linkActive ? 1 : 2);
+    if (state != linkState_) {
+      linkState_ = state;
+      writeLine(1, state == 0 ? "LINK WAIT" : (state == 1 ? "LINK OK" : "LINK LOST"));
+    }
+    if (activityDirty_) {
+      activityDirty_ = false;
+      writeLine(3, activity_);
+    }
+  }
+
+private:
+  uint8_t address_;
+  int8_t linkState_;
+  bool activityDirty_;
+  char activity_[17];
+
+  bool detect(uint8_t address) {
+    Wire.beginTransmission(address);
+    return Wire.endTransmission() == 0;
+  }
+
+  void command(uint8_t value) {
+    Wire.beginTransmission(address_);
+    Wire.write((uint8_t)0x00);
+    Wire.write(value);
+    Wire.endTransmission();
+  }
+
+  uint8_t glyphColumn(char value, uint8_t column) {
+    if (value >= 'a' && value <= 'z') {
+      value -= 'a' - 'A';
+    }
+    if (value >= '0' && value <= '9') {
+      return pgm_read_byte(&OLED_DIGITS[(value - '0') * 5 + column]);
+    }
+    if (value >= 'A' && value <= 'Z') {
+      return pgm_read_byte(&OLED_LETTERS[(value - 'A') * 5 + column]);
+    }
+    if (value == '-') {
+      return 0x08;
+    }
+    if (value == '+') {
+      return column == 2 ? 0x3E : 0x08;
+    }
+    if (value == ':') {
+      return column == 1 || column == 2 ? 0x36 : 0x00;
+    }
+    if (value == '_') {
+      return 0x40;
+    }
+    return 0;
+  }
+
+  void writeLine(uint8_t row, const char *text) {
+    command(0xB0 + row);
+    command(0x00);
+    command(0x10);
+
+    uint8_t length = strlen(text);
+    if (length > 16) {
+      length = 16;
+    }
+
+    for (uint8_t chunk = 0; chunk < 8; chunk++) {
+      uint8_t data[16];
+      for (uint8_t i = 0; i < 16; i++) {
+        uint8_t position = chunk * 16 + i;
+        uint8_t character = position / 8;
+        uint8_t column = position % 8;
+        data[i] = character < length && column < 5
+          ? glyphColumn(text[character], column)
+          : 0;
+      }
+      Wire.beginTransmission(address_);
+      Wire.write((uint8_t)0x40);
+      Wire.write(data, sizeof(data));
+      Wire.endTransmission();
+    }
+  }
+};
+
+#endif

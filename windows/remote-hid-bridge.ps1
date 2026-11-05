@@ -33,9 +33,11 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO.Ports;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Windows.Forms;
 
 public static class RemoteHidBridge
 {
@@ -110,6 +112,9 @@ public static class RemoteHidBridge
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
 
@@ -135,13 +140,23 @@ public static class RemoteHidBridge
     private static readonly int[] PendingMouseDown = new int[4];
     private static readonly int[] PendingMouseUp = new int[4];
     private static readonly object SerialSync = new object();
+    private static readonly object StateSync = new object();
 
     private static SerialPort serial;
+    private static string serialPortName;
+    private static int serialBaudRate;
+    private static DateTime reconnectAfter = DateTime.MinValue;
+    private static DateTime serialReadyAt;
+    private static bool serialWaiting;
     private static IntPtr keyboardHookHandle = IntPtr.Zero;
     private static IntPtr mouseHookHandle = IntPtr.Zero;
     private static HookProc keyboardHookCallback;
     private static HookProc mouseHookCallback;
-    private static Timer heartbeatTimer;
+    private static System.Threading.Timer heartbeatTimer;
+    private static int heartbeatActive;
+    private static NotifyIcon trayIcon;
+    private static ContextMenuStrip trayMenu;
+    private static string trayStatus = "";
     private static POINT lastMousePoint;
     private static int wheelRemainder;
     private static int pendingWheelEcho;
@@ -149,30 +164,30 @@ public static class RemoteHidBridge
     private static bool parsecMode;
     private static volatile bool running;
 
-    public static void Run(string portName, int baudRate, bool parsecInputMode)
+    public static void Run(string portName, int baudRate, bool parsecInputMode, string iconPath)
     {
         parsecMode = parsecInputMode;
+        serialPortName = portName;
+        serialBaudRate = baudRate;
         mainThreadId = GetCurrentThreadId();
         keyboardHookCallback = KeyboardHook;
         mouseHookCallback = MouseHook;
 
         try
         {
-            serial = new SerialPort(portName, baudRate);
-            serial.NewLine = "\n";
-            serial.WriteTimeout = 1000;
-            serial.Open();
-
+            OpenSerial(false);
             Thread.Sleep(2000);
             Send("R");
             GetCursorPos(out lastMousePoint);
+            InitializeTray(iconPath);
+            SetConnectionStatus("Connected");
 
             keyboardHookHandle = InstallHook(WH_KEYBOARD_LL, keyboardHookCallback);
             mouseHookHandle = InstallHook(WH_MOUSE_LL, mouseHookCallback);
 
             Console.CancelKeyPress += ConsoleCancel;
             running = true;
-            heartbeatTimer = new Timer(Heartbeat, null, 0, 500);
+            heartbeatTimer = new System.Threading.Timer(Heartbeat, null, 500, 500);
 
             Console.WriteLine("Remote HID bridge is running on " + portName + ".");
             Console.WriteLine("Keyboard: A-Z, 0-9, arrows, F1-F12, Space, Enter, Esc, Tab, Shift, Ctrl, Alt.");
@@ -180,7 +195,8 @@ public static class RemoteHidBridge
             Console.WriteLine(parsecMode
                 ? "Parsec mode: virtual HID input is captured with Arduino echo protection."
                 : "Standard mode: only remote injected input is captured.");
-            Console.WriteLine("Press Ctrl+C here to stop and release controls.");
+            Console.WriteLine("Emergency stop: Ctrl+Alt+F12.");
+            Console.WriteLine("Use the tray icon to release controls or exit, or press Ctrl+C here.");
 
             MSG message;
             while (running)
@@ -220,28 +236,166 @@ public static class RemoteHidBridge
                 mouseHookHandle = IntPtr.Zero;
             }
 
+            if (trayIcon != null)
+            {
+                trayIcon.Visible = false;
+                trayIcon.Dispose();
+                trayIcon = null;
+            }
+            if (trayMenu != null)
+            {
+                trayMenu.Dispose();
+                trayMenu = null;
+            }
+
             lock (SerialSync)
             {
-                if (serial != null)
+                try
                 {
-                    try
+                    if (serial != null && serial.IsOpen && !serialWaiting)
                     {
-                        if (serial.IsOpen)
-                        {
-                            serial.WriteLine("R");
-                            serial.Close();
-                        }
-                    }
-                    catch (Exception error)
-                    {
-                        Console.WriteLine("Could not send final release: " + error.Message);
-                    }
-                    finally
-                    {
-                        serial.Dispose();
+                        serial.WriteLine("R");
                     }
                 }
+                catch (Exception error)
+                {
+                    Console.WriteLine("Could not send final release: " + error.Message);
+                }
+                finally
+                {
+                    CloseSerial();
+                }
             }
+        }
+    }
+
+    private static void InitializeTray(string iconPath)
+    {
+        trayMenu = new ContextMenuStrip();
+        trayMenu.Items.Add("Release controls", null, ReleaseMenuClick);
+        trayMenu.Items.Add("Exit", null, ExitMenuClick);
+
+        trayIcon = new NotifyIcon();
+        trayIcon.Icon = System.IO.File.Exists(iconPath)
+            ? new Icon(iconPath)
+            : SystemIcons.Application;
+        trayIcon.Text = "Arduino Remote HID Bridge";
+        trayIcon.ContextMenuStrip = trayMenu;
+        trayIcon.DoubleClick += TrayDoubleClick;
+        trayIcon.Visible = true;
+    }
+
+    private static void SetConnectionStatus(string status)
+    {
+        if (trayStatus == status)
+        {
+            return;
+        }
+
+        trayStatus = status;
+        Console.WriteLine("Status: " + status);
+        if (trayIcon != null)
+        {
+            string text = "HID Bridge: " + status + " (" + serialPortName + ")";
+            trayIcon.Text = text.Length <= 63 ? text : text.Substring(0, 63);
+        }
+    }
+
+    private static void ReleaseMenuClick(object sender, EventArgs args)
+    {
+        ReleaseControls();
+    }
+
+    private static void ExitMenuClick(object sender, EventArgs args)
+    {
+        ReleaseControls();
+        RequestStop();
+    }
+
+    private static void TrayDoubleClick(object sender, EventArgs args)
+    {
+        ReleaseControls();
+    }
+
+    private static void ReleaseControls()
+    {
+        try
+        {
+            Send("R");
+        }
+        catch (Exception error)
+        {
+            HandleConnectionError(error);
+        }
+
+        lock (StateSync)
+        {
+            ResetInputState();
+        }
+    }
+
+    private static void ResetInputState()
+    {
+        PressedKeys.Clear();
+        PendingKeyDown.Clear();
+        PendingKeyUp.Clear();
+        Array.Clear(PendingMouseDown, 0, PendingMouseDown.Length);
+        Array.Clear(PendingMouseUp, 0, PendingMouseUp.Length);
+        wheelRemainder = 0;
+        pendingWheelEcho = 0;
+    }
+
+    private static void OpenSerial(bool waitForReset)
+    {
+        serial = new SerialPort(serialPortName, serialBaudRate);
+        serial.NewLine = "\n";
+        serial.WriteTimeout = 1000;
+        serial.Open();
+        serialWaiting = waitForReset;
+        serialReadyAt = DateTime.UtcNow.AddSeconds(2);
+    }
+
+    private static void CloseSerial()
+    {
+        serialWaiting = false;
+        if (serial == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (serial.IsOpen)
+            {
+                serial.Close();
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            serial.Dispose();
+            serial = null;
+        }
+    }
+
+    private static void HandleConnectionError(Exception error)
+    {
+        bool reportError = trayStatus == "Connected";
+        lock (SerialSync)
+        {
+            CloseSerial();
+            reconnectAfter = DateTime.UtcNow.AddSeconds(1);
+        }
+        lock (StateSync)
+        {
+            ResetInputState();
+        }
+        SetConnectionStatus("Reconnecting");
+        if (reportError)
+        {
+            Console.WriteLine("Connection lost: " + error.Message);
         }
     }
 
@@ -306,71 +460,82 @@ public static class RemoteHidBridge
     {
         if (nCode >= 0 && running)
         {
-            KBDLLHOOKSTRUCT data = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(
-                lParam,
-                typeof(KBDLLHOOKSTRUCT));
-
-            byte hidCode;
-            bool isInjected = (data.flags & LLKHF_INJECTED) != 0;
-            bool isMapped = KeyMap.TryGetValue(data.vkCode, out hidCode);
-
-            if (parsecMode)
+            lock (StateSync)
             {
-                Console.WriteLine("K vk=" + data.vkCode + " scan=" + data.scanCode
-                    + " flags=" + data.flags + " msg=" + wParam.ToInt32()
-                    + " hid=" + hidCode + " mapped=" + isMapped);
-            }
+                KBDLLHOOKSTRUCT data = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(
+                    lParam,
+                    typeof(KBDLLHOOKSTRUCT));
 
-            if (isMapped && (isInjected || parsecMode))
-            {
                 int message = wParam.ToInt32();
-                bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-                bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
-
-                if (parsecMode && !isInjected)
+                if (message == WM_KEYDOWN && data.vkCode == 0x7B
+                    && (GetAsyncKeyState(0x11) & 0x8000) != 0
+                    && (GetAsyncKeyState(0x12) & 0x8000) != 0)
                 {
-                    if (isDown && ConsumePending(PendingKeyDown, hidCode))
-                    {
-                        Console.WriteLine("K echo down passed: " + hidCode);
-                        return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-                    }
-                    if (isUp && ConsumePending(PendingKeyUp, hidCode))
-                    {
-                        Console.WriteLine("K echo up passed: " + hidCode);
-                        return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-                    }
-                    if (isDown && PressedKeys.Contains(data.vkCode))
-                    {
-                        Console.WriteLine("K repeat passed: " + hidCode);
-                        return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-                    }
-                }
-
-                try
-                {
-                    if (isDown)
-                    {
-                        if (PressedKeys.Add(data.vkCode))
-                        {
-                            AddPending(PendingKeyDown, hidCode);
-                            Send("D " + hidCode);
-                        }
-                    }
-                    else if (isUp)
-                    {
-                        PressedKeys.Remove(data.vkCode);
-                        Thread.Sleep(80);
-                        AddPending(PendingKeyUp, hidCode);
-                        Send("U " + hidCode);
-                    }
-
-                    return (IntPtr)1;
-                }
-                catch (Exception error)
-                {
-                    Console.WriteLine("Serial error: " + error.Message);
+                    ReleaseControls();
                     RequestStop();
                     return (IntPtr)1;
+                }
+
+                byte hidCode;
+                bool isInjected = (data.flags & LLKHF_INJECTED) != 0;
+                bool isMapped = KeyMap.TryGetValue(data.vkCode, out hidCode);
+
+                if (parsecMode)
+                {
+                    Console.WriteLine("K vk=" + data.vkCode + " scan=" + data.scanCode
+                        + " flags=" + data.flags + " msg=" + message
+                        + " hid=" + hidCode + " mapped=" + isMapped);
+                }
+
+                if (isMapped && (isInjected || parsecMode))
+                {
+                    bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+                    bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+                    if (parsecMode && !isInjected)
+                    {
+                        if (isDown && ConsumePending(PendingKeyDown, hidCode))
+                        {
+                            Console.WriteLine("K echo down passed: " + hidCode);
+                            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+                        }
+                        if (isUp && ConsumePending(PendingKeyUp, hidCode))
+                        {
+                            Console.WriteLine("K echo up passed: " + hidCode);
+                            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+                        }
+                        if (isDown && PressedKeys.Contains(data.vkCode))
+                        {
+                            Console.WriteLine("K repeat passed: " + hidCode);
+                            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+                        }
+                    }
+
+                    try
+                    {
+                        if (isDown)
+                        {
+                            if (PressedKeys.Add(data.vkCode))
+                            {
+                                AddPending(PendingKeyDown, hidCode);
+                                Send("D " + hidCode);
+                            }
+                        }
+                        else if (isUp)
+                        {
+                            PressedKeys.Remove(data.vkCode);
+                            Thread.Sleep(80);
+                            AddPending(PendingKeyUp, hidCode);
+                            Send("U " + hidCode);
+                        }
+
+                        return (IntPtr)1;
+                    }
+                    catch (Exception error)
+                    {
+                        HandleConnectionError(error);
+                        return (IntPtr)1;
+                    }
                 }
             }
         }
@@ -382,79 +547,81 @@ public static class RemoteHidBridge
     {
         if (nCode >= 0 && running)
         {
-            MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(
-                lParam,
-                typeof(MSLLHOOKSTRUCT));
-
-            int message = wParam.ToInt32();
-            bool isInjected = (data.flags & LLMHF_INJECTED) != 0;
-            int button = 0;
-            bool isDown = false;
-            bool isUp = false;
-
-            if (message == WM_LBUTTONDOWN) { button = 1; isDown = true; }
-            else if (message == WM_LBUTTONUP) { button = 1; isUp = true; }
-            else if (message == WM_RBUTTONDOWN) { button = 2; isDown = true; }
-            else if (message == WM_RBUTTONUP) { button = 2; isUp = true; }
-            else if (message == WM_MBUTTONDOWN) { button = 3; isDown = true; }
-            else if (message == WM_MBUTTONUP) { button = 3; isUp = true; }
-
-            bool isWheel = message == WM_MOUSEWHEEL;
-            if ((isInjected || parsecMode) && (button != 0 || isWheel))
+            lock (StateSync)
             {
-                if (parsecMode && !isInjected)
-                {
-                    if (isDown && ConsumeMousePending(PendingMouseDown, button))
-                    {
-                        return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
-                    }
-                    if (isUp && ConsumeMousePending(PendingMouseUp, button))
-                    {
-                        return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
-                    }
-                    if (isWheel && pendingWheelEcho > 0)
-                    {
-                        pendingWheelEcho--;
-                        return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
-                    }
-                }
+                MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(
+                    lParam,
+                    typeof(MSLLHOOKSTRUCT));
 
-                try
+                int message = wParam.ToInt32();
+                bool isInjected = (data.flags & LLMHF_INJECTED) != 0;
+                int button = 0;
+                bool isDown = false;
+                bool isUp = false;
+
+                if (message == WM_LBUTTONDOWN) { button = 1; isDown = true; }
+                else if (message == WM_LBUTTONUP) { button = 1; isUp = true; }
+                else if (message == WM_RBUTTONDOWN) { button = 2; isDown = true; }
+                else if (message == WM_RBUTTONUP) { button = 2; isUp = true; }
+                else if (message == WM_MBUTTONDOWN) { button = 3; isDown = true; }
+                else if (message == WM_MBUTTONUP) { button = 3; isUp = true; }
+
+                bool isWheel = message == WM_MOUSEWHEEL;
+                if ((isInjected || parsecMode) && (button != 0 || isWheel))
                 {
-                    if (button != 0)
+                    if (parsecMode && !isInjected)
                     {
-                        if (isUp)
+                        if (isDown && ConsumeMousePending(PendingMouseDown, button))
                         {
-                            Thread.Sleep(80);
+                            return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
                         }
-                        if (parsecMode)
+                        if (isUp && ConsumeMousePending(PendingMouseUp, button))
                         {
-                            int[] pending = isDown ? PendingMouseDown : PendingMouseUp;
-                            pending[button]++;
+                            return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
                         }
-                        Send("B " + button + (isDown ? " 1" : " 0"));
+                        if (isWheel && pendingWheelEcho > 0)
+                        {
+                            pendingWheelEcho--;
+                            return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
+                        }
+                    }
+
+                    try
+                    {
+                        if (button != 0)
+                        {
+                            if (isUp)
+                            {
+                                Thread.Sleep(80);
+                            }
+                            if (parsecMode)
+                            {
+                                int[] pending = isDown ? PendingMouseDown : PendingMouseUp;
+                                pending[button]++;
+                            }
+                            Send("B " + button + (isDown ? " 1" : " 0"));
+                            return (IntPtr)1;
+                        }
+
+                        short delta = (short)((data.mouseData >> 16) & 0xFFFF);
+                        wheelRemainder += delta;
+                        int ticks = wheelRemainder / 120;
+                        wheelRemainder %= 120;
+                        if (ticks != 0)
+                        {
+                            if (parsecMode)
+                            {
+                                pendingWheelEcho += Math.Abs(ticks);
+                            }
+                            Send("V " + ticks);
+                        }
                         return (IntPtr)1;
                     }
-
-                    short delta = (short)((data.mouseData >> 16) & 0xFFFF);
-                    wheelRemainder += delta;
-                    int ticks = wheelRemainder / 120;
-                    wheelRemainder %= 120;
-                    if (ticks != 0)
+                    catch (Exception error)
                     {
-                        if (parsecMode)
-                        {
-                            pendingWheelEcho += Math.Abs(ticks);
-                        }
-                        Send("V " + ticks);
+                        HandleConnectionError(error);
+                        return (IntPtr)1;
                     }
-                    return (IntPtr)1;
-                }
-                catch (Exception error)
-                {
-                    Console.WriteLine("Serial error: " + error.Message);
-                    RequestStop();
-                    return (IntPtr)1;
                 }
             }
         }
@@ -506,19 +673,52 @@ public static class RemoteHidBridge
 
     private static void Heartbeat(object state)
     {
-        if (!running)
+        if (!running || Interlocked.Exchange(ref heartbeatActive, 1) == 1)
         {
             return;
         }
 
         try
         {
-            Send("H");
+            lock (SerialSync)
+            {
+                if (!running)
+                {
+                    return;
+                }
+
+                if (serial == null)
+                {
+                    if (DateTime.UtcNow < reconnectAfter)
+                    {
+                        return;
+                    }
+                    OpenSerial(true);
+                    SetConnectionStatus("Waiting for Arduino");
+                    return;
+                }
+
+                if (serialWaiting)
+                {
+                    if (DateTime.UtcNow < serialReadyAt)
+                    {
+                        return;
+                    }
+                    serialWaiting = false;
+                    serial.WriteLine("R");
+                }
+
+                Send("H");
+            }
+            SetConnectionStatus("Connected");
         }
         catch (Exception error)
         {
-            Console.WriteLine("Connection lost: " + error.Message);
-            RequestStop();
+            HandleConnectionError(error);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref heartbeatActive, 0);
         }
     }
 
@@ -526,9 +726,9 @@ public static class RemoteHidBridge
     {
         lock (SerialSync)
         {
-            if (serial == null || !serial.IsOpen)
+            if (serial == null || !serial.IsOpen || serialWaiting)
             {
-                throw new InvalidOperationException("Serial port is not open.");
+                throw new InvalidOperationException("Serial port is not ready.");
             }
 
             serial.WriteLine(command);
@@ -538,6 +738,7 @@ public static class RemoteHidBridge
     private static void ConsoleCancel(object sender, ConsoleCancelEventArgs args)
     {
         args.Cancel = true;
+        ReleaseControls();
         RequestStop();
     }
 
@@ -554,5 +755,5 @@ public static class RemoteHidBridge
 }
 "@
 
-Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll
-[RemoteHidBridge]::Run($Port, $BaudRate, $ParsecMode.IsPresent)
+Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll, System.Drawing.dll, System.Windows.Forms.dll
+[RemoteHidBridge]::Run($Port, $BaudRate, $ParsecMode.IsPresent, (Join-Path $PSScriptRoot 'bridge.ico'))
