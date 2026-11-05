@@ -32,7 +32,7 @@ A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or 
 
 ## 3D-printed enclosure
 
-`enclosure/` contains a base and lid for a typical 34×18 mm Pro Micro. The 42×26 mm case has a micro-USB cable notch and side/lid ventilation slots. Print both parts without supports: base upright, lid with its outer face on the bed. Measure your board before printing; dimensions and clearances are adjustable in `generate_enclosure.py`.
+`enclosure/` contains a base and lid for a typical 34×18 mm Pro Micro. The 42×26 mm case has a micro-USB cable notch and side/lid ventilation slots. Print both parts without supports: base upright, lid with its outer face on the bed. Measure your board before printing.
 
 ## Supported input
 
@@ -45,5 +45,5 @@ A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or 
 - `windows/remote-hid-bridge.ps1` — captures remote input, forwards it to the Arduino and manages the tray icon.
 - `windows/start-hid-bridge.cmd` — standard mode for RustDesk; captures injected remote input.
 - `windows/start-parsec-hid-bridge.cmd` — Parsec/Moonlight mode; captures virtual HID input and filters out Arduino echo.
-- `enclosure/` — printable STL files and their standard-library Python generator.
+- `enclosure/` — printable base and lid STL files.
 - `assets/` — repository logo and social preview.
