@@ -24,7 +24,7 @@ The COM port is detected automatically. To specify it explicitly:
 windows\start-parsec-hid-bridge.cmd COM7
 ```
 
-The tray icon shows the connection state and provides **Release controls** and **Exit**. If the Arduino reconnects on the same COM port, the bridge restores the connection automatically. Press **Ctrl+Alt+F12** for an emergency stop or **Ctrl+C** in the console.
+The tray menu shows the connection state, COM port and mode. **Pause input** releases all controls and stops forwarding until resumed; **Reconnect** restarts the serial connection. **Release controls** is also available on double-click. If Arduino disconnects, input passes directly to Windows until the bridge reconnects. Press **Ctrl+Alt+F12** for an emergency stop or **Ctrl+C** in the console.
 
 ## Optional OLED
 

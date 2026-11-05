@@ -156,12 +156,16 @@ public static class RemoteHidBridge
     private static int heartbeatActive;
     private static NotifyIcon trayIcon;
     private static ContextMenuStrip trayMenu;
+    private static ToolStripMenuItem statusMenuItem;
+    private static ToolStripMenuItem pauseMenuItem;
     private static string trayStatus = "";
     private static POINT lastMousePoint;
     private static int wheelRemainder;
     private static int pendingWheelEcho;
     private static int mainThreadId;
     private static bool parsecMode;
+    private static volatile bool inputPaused;
+    private static volatile bool inputReady;
     private static volatile bool running;
 
     public static void Run(string portName, int baudRate, bool parsecInputMode, string iconPath)
@@ -272,6 +276,13 @@ public static class RemoteHidBridge
     private static void InitializeTray(string iconPath)
     {
         trayMenu = new ContextMenuStrip();
+        statusMenuItem = new ToolStripMenuItem("Starting");
+        statusMenuItem.Enabled = false;
+        trayMenu.Items.Add(statusMenuItem);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        pauseMenuItem = new ToolStripMenuItem("Pause input", null, PauseMenuClick);
+        trayMenu.Items.Add(pauseMenuItem);
+        trayMenu.Items.Add("Reconnect", null, ReconnectMenuClick);
         trayMenu.Items.Add("Release controls", null, ReleaseMenuClick);
         trayMenu.Items.Add("Exit", null, ExitMenuClick);
 
@@ -287,6 +298,7 @@ public static class RemoteHidBridge
 
     private static void SetConnectionStatus(string status)
     {
+        inputReady = status == "Connected";
         if (trayStatus == status)
         {
             return;
@@ -294,11 +306,44 @@ public static class RemoteHidBridge
 
         trayStatus = status;
         Console.WriteLine("Status: " + status);
-        if (trayIcon != null)
+        UpdateStatusText();
+    }
+
+    private static void UpdateStatusText()
+    {
+        if (trayIcon == null)
         {
-            string text = "HID Bridge: " + status + " (" + serialPortName + ")";
-            trayIcon.Text = text.Length <= 63 ? text : text.Substring(0, 63);
+            return;
         }
+
+        string mode = parsecMode ? "Parsec" : "Standard";
+        string paused = inputPaused ? " | Paused" : "";
+        string text = "HID Bridge: " + trayStatus + paused + " (" + serialPortName + ")";
+        trayIcon.Text = text.Length <= 63 ? text : text.Substring(0, 63);
+        statusMenuItem.Text = trayStatus + " | " + serialPortName + " | " + mode + paused;
+    }
+
+    private static void PauseMenuClick(object sender, EventArgs args)
+    {
+        inputPaused = !inputPaused;
+        if (inputPaused)
+        {
+            ReleaseControls();
+        }
+        pauseMenuItem.Text = inputPaused ? "Resume input" : "Pause input";
+        UpdateStatusText();
+    }
+
+    private static void ReconnectMenuClick(object sender, EventArgs args)
+    {
+        ReleaseControls();
+        lock (SerialSync)
+        {
+            CloseSerial();
+            reconnectAfter = DateTime.MinValue;
+        }
+        SetConnectionStatus("Reconnecting");
+        Heartbeat(null);
     }
 
     private static void ReleaseMenuClick(object sender, EventArgs args)
@@ -489,6 +534,15 @@ public static class RemoteHidBridge
 
                 if (isMapped && (isInjected || parsecMode))
                 {
+                    if (!inputReady)
+                    {
+                        return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+                    }
+                    if (inputPaused)
+                    {
+                        return (IntPtr)1;
+                    }
+
                     bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
                     bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
 
@@ -569,6 +623,15 @@ public static class RemoteHidBridge
                 bool isWheel = message == WM_MOUSEWHEEL;
                 if ((isInjected || parsecMode) && (button != 0 || isWheel))
                 {
+                    if (!inputReady)
+                    {
+                        return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
+                    }
+                    if (inputPaused)
+                    {
+                        return (IntPtr)1;
+                    }
+
                     if (parsecMode && !isInjected)
                     {
                         if (isDown && ConsumeMousePending(PendingMouseDown, button))
