@@ -113,9 +113,6 @@ public static class RemoteHidBridge
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
-    private static extern bool GetCursorPos(out POINT lpPoint);
-
-    [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int virtualKey);
 
     [DllImport("user32.dll")]
@@ -143,8 +140,9 @@ public static class RemoteHidBridge
     private static extern IntPtr DispatchMessage(ref MSG lpMsg);
 
     private static readonly Dictionary<uint, byte> KeyMap = CreateKeyMap();
-    private static readonly HashSet<uint> PressedKeys = new HashSet<uint>();
-    private static readonly HashSet<uint> ReleasingKeys = new HashSet<uint>();
+    private static readonly HashSet<byte> PressedKeys = new HashSet<byte>();
+    private static readonly HashSet<byte> ReleasingKeys = new HashSet<byte>();
+    private static readonly Random InputRandom = new Random();
     private static readonly Dictionary<byte, int> PendingKeyDown = new Dictionary<byte, int>();
     private static readonly Dictionary<byte, int> PendingKeyUp = new Dictionary<byte, int>();
     private static readonly int[] PendingMouseDown = new int[4];
@@ -190,7 +188,6 @@ public static class RemoteHidBridge
     private static ToolStripMenuItem consoleMenuItem;
     private static bool consoleVisible = true;
     private static string trayStatus = "";
-    private static POINT lastMousePoint;
     private static int wheelRemainder;
     private static int pendingWheelEcho;
     private static int mainThreadId;
@@ -216,7 +213,6 @@ public static class RemoteHidBridge
             OpenSerial(false);
             Thread.Sleep(2000);
             Send("R");
-            GetCursorPos(out lastMousePoint);
             InitializeTray(iconPath);
             SetConnectionStatus("Connected");
             running = true;
@@ -667,13 +663,13 @@ public static class RemoteHidBridge
                         }
                         if (isUp && ConsumePending(PendingKeyUp, hidCode))
                         {
-                            if (ReleasingKeys.Remove(data.vkCode))
+                            if (ReleasingKeys.Remove(hidCode))
                             {
-                                PressedKeys.Remove(data.vkCode);
+                                PressedKeys.Remove(hidCode);
                             }
                             return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
                         }
-                        if (isDown && PressedKeys.Contains(data.vkCode))
+                        if (isDown && PressedKeys.Contains(hidCode))
                         {
                             return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
                         }
@@ -681,8 +677,8 @@ public static class RemoteHidBridge
 
                     if (isDown)
                     {
-                        bool isRepress = ReleasingKeys.Remove(data.vkCode);
-                        if (PressedKeys.Add(data.vkCode) || isRepress)
+                        bool isRepress = ReleasingKeys.Remove(hidCode);
+                        if (PressedKeys.Add(hidCode) || isRepress)
                         {
                             AddPending(PendingKeyDown, hidCode);
                             EnqueueCommand("D " + hidCode, 0);
@@ -692,17 +688,17 @@ public static class RemoteHidBridge
                     {
                         if (parsecMode)
                         {
-                            if (PressedKeys.Contains(data.vkCode) && !ReleasingKeys.Add(data.vkCode))
+                            if (PressedKeys.Contains(hidCode) && !ReleasingKeys.Add(hidCode))
                             {
                                 return (IntPtr)1;
                             }
                         }
                         else
                         {
-                            PressedKeys.Remove(data.vkCode);
+                            PressedKeys.Remove(hidCode);
                         }
                         AddPending(PendingKeyUp, hidCode);
-                        EnqueueCommand("U " + hidCode, 80);
+                        EnqueueCommand("U " + hidCode, InputRandom.Next(65, 96));
                     }
 
                     return (IntPtr)1;
@@ -772,7 +768,9 @@ public static class RemoteHidBridge
                             int[] pending = isDown ? PendingMouseDown : PendingMouseUp;
                             pending[button]++;
                         }
-                        EnqueueCommand("B " + button + (isDown ? " 1" : " 0"), isUp ? 80 : 0);
+                        EnqueueCommand(
+                            "B " + button + (isDown ? " 1" : " 0"),
+                            isUp ? InputRandom.Next(65, 96) : 0);
                         return (IntPtr)1;
                     }
 
