@@ -5,7 +5,8 @@ param(
     [switch]$ParsecMode
 )
 
-if ([string]::IsNullOrWhiteSpace($Port)) {
+$autoDetectPort = [string]::IsNullOrWhiteSpace($Port)
+if ($autoDetectPort) {
     $serialPorts = @(Get-CimInstance Win32_SerialPort)
     $detectedPorts = @($serialPorts | Where-Object {
         $_.Name -match "Arduino Leonardo|Pro Micro" -or
@@ -35,6 +36,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO.Ports;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -164,13 +166,15 @@ public static class RemoteHidBridge
     private static int pendingWheelEcho;
     private static int mainThreadId;
     private static bool parsecMode;
+    private static bool autoDetectPort;
     private static volatile bool inputPaused;
     private static volatile bool inputReady;
     private static volatile bool running;
 
-    public static void Run(string portName, int baudRate, bool parsecInputMode, string iconPath)
+    public static void Run(string portName, int baudRate, bool parsecInputMode, string iconPath, bool detectPortAutomatically)
     {
         parsecMode = parsecInputMode;
+        autoDetectPort = detectPortAutomatically;
         serialPortName = portName;
         serialBaudRate = baudRate;
         mainThreadId = GetCurrentThreadId();
@@ -388,6 +392,43 @@ public static class RemoteHidBridge
         Array.Clear(PendingMouseUp, 0, PendingMouseUp.Length);
         wheelRemainder = 0;
         pendingWheelEcho = 0;
+    }
+
+    private static string DetectArduinoPort()
+    {
+        List<string> arduinoPorts = new List<string>();
+        List<string> usbPorts = new List<string>();
+
+        using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+            "SELECT DeviceID, Name, PNPDeviceID FROM Win32_SerialPort"))
+        using (ManagementObjectCollection results = searcher.Get())
+        {
+            foreach (ManagementObject port in results)
+            {
+                string deviceId = Convert.ToString(port["DeviceID"]);
+                string name = Convert.ToString(port["Name"]);
+                string pnpId = Convert.ToString(port["PNPDeviceID"]);
+
+                if (ContainsText(name, "Arduino Leonardo") || ContainsText(name, "Pro Micro")
+                    || ContainsText(pnpId, "VID_2341&PID_") || ContainsText(pnpId, "VID_1B4F&PID_"))
+                {
+                    arduinoPorts.Add(deviceId);
+                }
+                if (pnpId != null && pnpId.StartsWith("USB", StringComparison.OrdinalIgnoreCase))
+                {
+                    usbPorts.Add(deviceId);
+                }
+                port.Dispose();
+            }
+        }
+
+        List<string> candidates = arduinoPorts.Count > 0 ? arduinoPorts : usbPorts;
+        return candidates.Count == 1 ? candidates[0] : null;
+    }
+
+    private static bool ContainsText(string value, string fragment)
+    {
+        return value != null && value.IndexOf(fragment, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static void OpenSerial(bool waitForReset)
@@ -756,6 +797,21 @@ public static class RemoteHidBridge
                     {
                         return;
                     }
+                    if (autoDetectPort)
+                    {
+                        string detectedPort = DetectArduinoPort();
+                        if (detectedPort == null)
+                        {
+                            reconnectAfter = DateTime.UtcNow.AddSeconds(1);
+                            SetConnectionStatus("Port not found");
+                            return;
+                        }
+                        if (serialPortName != detectedPort)
+                        {
+                            serialPortName = detectedPort;
+                            Console.WriteLine("Arduino port: " + detectedPort);
+                        }
+                    }
                     OpenSerial(true);
                     SetConnectionStatus("Waiting for Arduino");
                     return;
@@ -818,5 +874,5 @@ public static class RemoteHidBridge
 }
 "@
 
-Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll, System.Drawing.dll, System.Windows.Forms.dll
-[RemoteHidBridge]::Run($Port, $BaudRate, $ParsecMode.IsPresent, (Join-Path $PSScriptRoot 'bridge.ico'))
+Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll, System.Management.dll, System.Drawing.dll, System.Windows.Forms.dll
+[RemoteHidBridge]::Run($Port, $BaudRate, $ParsecMode.IsPresent, (Join-Path $PSScriptRoot 'bridge.ico'), $autoDetectPort)
