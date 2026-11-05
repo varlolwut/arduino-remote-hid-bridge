@@ -1,9 +1,18 @@
 @echo off
 setlocal
 
-net session >nul 2>&1
+powershell.exe -NoProfile -Command "$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }"
 if errorlevel 1 (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+    if "%*"=="" (
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs } catch { Write-Host $_.Exception.Message; exit 1 }"
+    ) else (
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -ArgumentList '%*' -Verb RunAs } catch { Write-Host $_.Exception.Message; exit 1 }"
+    )
+    if errorlevel 1 (
+        echo.
+        echo Could not request administrator rights. Right-click this file and choose Run as administrator.
+        pause
+    )
     exit /b
 )
 
