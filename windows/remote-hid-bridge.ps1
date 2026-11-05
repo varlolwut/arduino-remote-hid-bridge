@@ -117,6 +117,12 @@ public static class RemoteHidBridge
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int virtualKey);
 
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr windowHandle, int command);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
 
@@ -160,6 +166,8 @@ public static class RemoteHidBridge
     private static ContextMenuStrip trayMenu;
     private static ToolStripMenuItem statusMenuItem;
     private static ToolStripMenuItem pauseMenuItem;
+    private static ToolStripMenuItem consoleMenuItem;
+    private static bool consoleVisible = true;
     private static string trayStatus = "";
     private static POINT lastMousePoint;
     private static int wheelRemainder;
@@ -287,6 +295,8 @@ public static class RemoteHidBridge
         pauseMenuItem = new ToolStripMenuItem("Pause input", null, PauseMenuClick);
         trayMenu.Items.Add(pauseMenuItem);
         trayMenu.Items.Add("Reconnect", null, ReconnectMenuClick);
+        consoleMenuItem = new ToolStripMenuItem("Hide console", null, ConsoleMenuClick);
+        trayMenu.Items.Add(consoleMenuItem);
         trayMenu.Items.Add("Release controls", null, ReleaseMenuClick);
         trayMenu.Items.Add("Exit", null, ExitMenuClick);
 
@@ -348,6 +358,19 @@ public static class RemoteHidBridge
         }
         SetConnectionStatus("Reconnecting");
         Heartbeat(null);
+    }
+
+    private static void ConsoleMenuClick(object sender, EventArgs args)
+    {
+        IntPtr consoleWindow = GetConsoleWindow();
+        if (consoleWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        consoleVisible = !consoleVisible;
+        ShowWindow(consoleWindow, consoleVisible ? 5 : 0);
+        consoleMenuItem.Text = consoleVisible ? "Hide console" : "Show console";
     }
 
     private static void ReleaseMenuClick(object sender, EventArgs args)
