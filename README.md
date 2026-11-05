@@ -27,3 +27,10 @@ Keep the bridge window open while playing. Press `Ctrl+C` in that window to stop
 
 - Keyboard: A–Z, 0–9, arrows, F1–F12, Space, Enter, Esc, Tab, Shift, Ctrl and Alt.
 - Mouse: left, right and middle buttons, plus wheel. Cursor movement is passed through by the remote desktop software.
+
+## Files
+
+- `firmware/` — turns the Pro Micro into a USB keyboard and mouse.
+- `windows/remote-hid-bridge.ps1` — captures remote input and forwards it to the Arduino.
+- `windows/start-*.cmd` — launch the bridge in the appropriate mode with administrator rights.
+- `windows/test-*.cmd` — optional direct-input diagnostics.
