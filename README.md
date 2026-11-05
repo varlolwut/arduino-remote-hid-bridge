@@ -30,6 +30,10 @@ The tray icon shows the connection state and provides **Release controls** and *
 
 A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or `0x3D`. Connect SDA to D2, SCL to D3, GND to GND, and VCC according to the display module. It shows the link state and last input event. No display or external display library is required.
 
+## 3D-printed enclosure
+
+`enclosure/` contains a base and lid for a typical 34×18 mm Pro Micro. The 42×26 mm case has a micro-USB cable notch and side/lid ventilation slots. Print both parts without supports: base upright, lid with its outer face on the bed. Measure your board before printing; dimensions and clearances are adjustable in `generate_enclosure.py`.
+
 ## Supported input
 
 - Keyboard: A–Z, 0–9, arrows, F1–F12, Space, Enter, Esc, Tab, Shift, Ctrl and Alt.
@@ -41,4 +45,5 @@ A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or 
 - `windows/remote-hid-bridge.ps1` — captures remote input, forwards it to the Arduino and manages the tray icon.
 - `windows/start-hid-bridge.cmd` — standard mode for RustDesk; captures injected remote input.
 - `windows/start-parsec-hid-bridge.cmd` — Parsec/Moonlight mode; captures virtual HID input and filters out Arduino echo.
+- `enclosure/` — printable STL files and their standard-library Python generator.
 - `assets/` — repository logo and social preview.
