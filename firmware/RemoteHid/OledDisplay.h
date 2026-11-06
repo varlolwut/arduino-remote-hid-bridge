@@ -48,9 +48,11 @@ const uint8_t OLED_LETTERS[] PROGMEM = {
 
 class OledDisplay {
 public:
-  OledDisplay() : address_(0), linkState_(-1), activityDirty_(false) {
-    activity_[0] = '\0';
-  }
+  OledDisplay()
+    : address_(0), linkStatus_(-1), normalState_(0), reconnecting_(false),
+      syncError_(false), rttMs_(-1), stateDirty_(false), linkDirty_(false),
+      inputDirty_(false), rttDirty_(false), releaseActive_(false),
+      releaseUntil_(0), lastRttDisplayAt_(0) {}
 
   void begin() {
     Wire.begin();
@@ -71,17 +73,39 @@ public:
     }
 
     writeLine(0, "REMOTE HID");
-    writeLine(2, "HID READY");
-    setActivity("READY");
+    writeLine(1, "HID ACTIVE");
+    writeLine(2, "LINK WAIT");
+    writeLine(3, "INPUT OK");
   }
 
-  void setActivity(const char *activity) {
-    if (address_ == 0) {
-      return;
+  void setState(uint8_t state) {
+    if (state == 5) {
+      syncError_ = true;
+    } else {
+      normalState_ = state;
+      syncError_ = false;
+      stateDirty_ = true;
     }
-    strncpy(activity_, activity, 16);
-    activity_[16] = '\0';
-    activityDirty_ = true;
+    inputDirty_ = true;
+  }
+
+  void setRtt(unsigned long rttMs) {
+    rttMs_ = (long)rttMs;
+    rttDirty_ = true;
+  }
+
+  void setReconnect(bool reconnecting) {
+    if (reconnecting_ != reconnecting) {
+      reconnecting_ = reconnecting;
+      linkDirty_ = true;
+      inputDirty_ = true;
+    }
+  }
+
+  void showReleaseAll() {
+    releaseActive_ = true;
+    releaseUntil_ = millis() + 1000;
+    inputDirty_ = true;
   }
 
   void update(bool hasLink, bool linkActive) {
@@ -89,22 +113,46 @@ public:
       return;
     }
 
-    uint8_t state = !hasLink ? 0 : (linkActive ? 1 : 2);
-    if (state != linkState_) {
-      linkState_ = state;
-      writeLine(1, state == 0 ? "LINK WAIT" : (state == 1 ? "LINK OK" : "LINK LOST"));
+    uint8_t status = hasLink && !linkActive ? 2 : (reconnecting_ ? 3 : (!hasLink ? 0 : 1));
+    if (status != linkStatus_) {
+      linkStatus_ = status;
+      linkDirty_ = true;
+      inputDirty_ = true;
     }
-    if (activityDirty_) {
-      activityDirty_ = false;
-      writeLine(3, activity_);
+    if (releaseActive_ && (long)(millis() - releaseUntil_) >= 0) {
+      releaseActive_ = false;
+      inputDirty_ = true;
+    }
+    if (stateDirty_) {
+      stateDirty_ = false;
+      writeWindowState();
+    }
+    if (linkDirty_ || (rttDirty_ && linkStatus_ == 1 && millis() - lastRttDisplayAt_ >= 1000)) {
+      linkDirty_ = false;
+      rttDirty_ = false;
+      lastRttDisplayAt_ = millis();
+      writeLinkState();
+    }
+    if (inputDirty_) {
+      inputDirty_ = false;
+      writeInputState();
     }
   }
 
 private:
   uint8_t address_;
-  int8_t linkState_;
-  bool activityDirty_;
-  char activity_[17];
+  int8_t linkStatus_;
+  uint8_t normalState_;
+  bool reconnecting_;
+  bool syncError_;
+  long rttMs_;
+  bool stateDirty_;
+  bool linkDirty_;
+  bool inputDirty_;
+  bool rttDirty_;
+  bool releaseActive_;
+  unsigned long releaseUntil_;
+  unsigned long lastRttDisplayAt_;
 
   bool detect(uint8_t address) {
     Wire.beginTransmission(address);
@@ -116,6 +164,62 @@ private:
     Wire.write((uint8_t)0x00);
     Wire.write(value);
     Wire.endTransmission();
+  }
+
+  void writeWindowState() {
+    switch (normalState_) {
+      case 1: writeLine(1, "HID PAUSED"); break;
+      case 2: writeLine(1, "L2 ACTIVE"); break;
+      case 3: writeLine(1, "WINDOW LOST"); break;
+      case 4: writeLine(1, "L2 PAUSED"); break;
+      default: writeLine(1, "HID ACTIVE"); break;
+    }
+  }
+
+  void writeLinkState() {
+    if (linkStatus_ == 0) {
+      writeLine(2, "LINK WAIT");
+      return;
+    }
+    if (linkStatus_ == 2) {
+      writeLine(2, "LINK LOST");
+      return;
+    }
+    if (linkStatus_ == 3) {
+      writeLine(2, "RECONNECT");
+      return;
+    }
+    if (rttMs_ < 0) {
+      writeLine(2, "LINK --- MS");
+      return;
+    }
+    if (rttMs_ > 999) {
+      writeLine(2, "LINK >999MS");
+      return;
+    }
+    char text[17];
+    snprintf(text, sizeof(text), "LINK %ld MS", rttMs_);
+    writeLine(2, text);
+  }
+
+  void writeInputState() {
+    if (syncError_) {
+      writeLine(3, "SYNC ERROR");
+      return;
+    }
+    if (releaseActive_) {
+      writeLine(3, "RELEASE ALL");
+      return;
+    }
+    if (linkStatus_ == 2 || normalState_ == 3) {
+      writeLine(3, "INPUT HOLD");
+      return;
+    }
+    if (normalState_ == 1 || normalState_ == 4) {
+      writeLine(3, "PAUSED");
+      return;
+    }
+    writeLine(3, "INPUT OK");
   }
 
   uint8_t glyphColumn(char value, uint8_t column) {
@@ -130,6 +234,9 @@ private:
     }
     if (value == '-') {
       return 0x08;
+    }
+    if (value == '>') {
+      return column == 0 ? 0x41 : (column == 1 ? 0x22 : (column == 2 ? 0x14 : 0x08));
     }
     if (value == '+') {
       return column == 2 ? 0x3E : 0x08;
@@ -152,7 +259,6 @@ private:
     if (length > 16) {
       length = 16;
     }
-
     for (uint8_t chunk = 0; chunk < 8; chunk++) {
       uint8_t data[16];
       for (uint8_t i = 0; i < 16; i++) {

@@ -112,13 +112,11 @@ void pressKey(uint8_t code) {
   if (hidCode == 0) {
     return;
   }
-
   for (uint8_t i = 0; i < 6; i++) {
     if (keyboardReport.keys[i] == hidCode) {
       return;
     }
   }
-
   for (uint8_t i = 0; i < 6; i++) {
     if (keyboardReport.keys[i] == 0) {
       keyboardReport.keys[i] = hidCode;
@@ -174,7 +172,6 @@ void setMouseButton(uint8_t button, bool pressed) {
   if (button < 1 || button > 3) {
     return;
   }
-
   uint8_t mask = 1 << (button - 1);
   if (pressed) {
     mouseReport.buttons |= mask;
@@ -203,17 +200,15 @@ void scrollMouse(int ticks) {
 void releaseControls() {
   memset(&keyboardReport, 0, sizeof(keyboardReport));
   memset(&mouseReport, 0, sizeof(mouseReport));
-
   if (keysMayBePressed) {
     sendKeyboardReport();
   }
   if (mouseButtonsMayBePressed) {
     sendMouseReport();
   }
-
   keysMayBePressed = false;
   mouseButtonsMayBePressed = false;
-  display.setActivity("RELEASE ALL");
+  display.showReleaseAll();
 }
 
 bool parseLong(const char *text, long *value, char **end) {
@@ -221,23 +216,92 @@ bool parseLong(const char *text, long *value, char **end) {
   return *end != text;
 }
 
+bool parseUnsignedLong(const char *text, unsigned long *value, char **end) {
+  *value = strtoul(text, end, 10);
+  return *end != text;
+}
+
+void markValidCommand() {
+  hasLink = true;
+  lastCommandAt = millis();
+}
+
+void printHexByte(uint8_t value) {
+  if (value < 16) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+void sendPong(unsigned long sequence) {
+  Serial.print("PONG ");
+  Serial.print(sequence);
+  Serial.print(' ');
+  printHexByte(keyboardReport.modifiers);
+  Serial.print(' ');
+  printHexByte(mouseReport.buttons);
+  Serial.print(' ');
+  for (uint8_t i = 0; i < 6; i++) {
+    printHexByte(keyboardReport.keys[i]);
+  }
+  Serial.println();
+}
+
 void handleCommand(const char *command) {
-  if (strcmp(command, "H") == 0) {
-    hasLink = true;
-    lastCommandAt = millis();
-    return;
-  }
-
-  if (strcmp(command, "R") == 0) {
-    releaseControls();
-    hasLink = true;
-    lastCommandAt = millis();
-    return;
-  }
-
   char *end;
   long first;
   long second;
+
+  if (command[0] == 'H' && command[1] == 'E' && command[2] == 'L'
+      && command[3] == 'L' && command[4] == 'O' && command[5] == ' ') {
+    if (!parseLong(command + 6, &first, &end) || *end != '\0') {
+      return;
+    }
+    Serial.println("READY 2");
+    display.setReconnect(true);
+    markValidCommand();
+    return;
+  }
+
+  if (command[0] == 'P' && command[1] == 'I' && command[2] == 'N'
+      && command[3] == 'G' && command[4] == ' ') {
+    unsigned long sequence;
+    if (!parseUnsignedLong(command + 5, &sequence, &end) || *end != '\0') {
+      return;
+    }
+    sendPong(sequence);
+    display.setReconnect(false);
+    markValidCommand();
+    return;
+  }
+
+  if (strcmp(command, "H") == 0) {
+    display.setReconnect(false);
+    markValidCommand();
+    return;
+  }
+  if (strcmp(command, "R") == 0) {
+    releaseControls();
+    markValidCommand();
+    return;
+  }
+
+  if (command[0] == 'S' && command[1] == ' ') {
+    if (!parseLong(command + 2, &first, &end) || *end != '\0' || first < 0 || first > 5) {
+      return;
+    }
+    display.setState((uint8_t)first);
+    markValidCommand();
+    return;
+  }
+  if (command[0] == 'T' && command[1] == ' ') {
+    if (!parseLong(command + 2, &first, &end) || *end != '\0' || first < 0 || first > 999999) {
+      return;
+    }
+    display.setRtt((unsigned long)first);
+    markValidCommand();
+    return;
+  }
 
   if (command[0] == 'M' && command[1] == ' ') {
     if (!parseLong(command + 2, &first, &end) || *end != ' ') {
@@ -279,21 +343,7 @@ void handleCommand(const char *command) {
   } else {
     return;
   }
-
-  if (command[0] == 'D') {
-    display.setActivity("KEY DOWN");
-  } else if (command[0] == 'U') {
-    display.setActivity("KEY UP");
-  } else if (command[0] == 'B') {
-    display.setActivity("MOUSE BUTTON");
-  } else if (command[0] == 'V') {
-    display.setActivity("WHEEL");
-  } else if (command[0] == 'M') {
-    display.setActivity("MOUSE MOVE");
-  }
-
-  hasLink = true;
-  lastCommandAt = millis();
+  markValidCommand();
 }
 
 void setup() {
@@ -305,7 +355,6 @@ void setup() {
 void loop() {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
-
     if (incoming == '\r' || incoming == '\n') {
       if (commandLength > 0) {
         commandBuffer[commandLength] = '\0';

@@ -2,7 +2,8 @@
 param(
     [string]$Port = "",
     [int]$BaudRate = 115200,
-    [switch]$ParsecMode
+    [switch]$ParsecMode,
+    [switch]$LineageMode
 )
 
 $autoDetectPort = [string]::IsNullOrWhiteSpace($Port)
@@ -39,6 +40,7 @@ using System.Drawing;
 using System.IO.Ports;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -118,6 +120,15 @@ public static class RemoteHidBridge
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr windowHandle, int command);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int maximumLength);
+
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetConsoleWindow();
 
@@ -149,42 +160,67 @@ public static class RemoteHidBridge
     private static readonly int[] PendingMouseUp = new int[4];
     private static readonly object SerialSync = new object();
     private static readonly object StateSync = new object();
+    private static readonly object ExpectedSync = new object();
     private static readonly object LogSync = new object();
     private static readonly string LogPath = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "RemoteHidBridge",
         "bridge.log");
+    private static readonly byte[] ExpectedKeys = new byte[6];
 
     private sealed class BridgeCommand
     {
         public string Text;
         public DateTime Due;
+        public long Generation;
 
-        public BridgeCommand(string text, int delayMilliseconds)
+        public BridgeCommand(string text, int delayMilliseconds, long generation)
         {
             Text = text;
             Due = DateTime.UtcNow.AddMilliseconds(delayMilliseconds);
+            Generation = generation;
         }
     }
 
     private static readonly BlockingCollection<BridgeCommand> CommandQueue = new BlockingCollection<BridgeCommand>();
     private static Thread commandWorker;
+    private static Thread serialReader;
     private static SerialPort serial;
     private static string serialPortName;
     private static int serialBaudRate;
     private static DateTime reconnectAfter = DateTime.MinValue;
     private static DateTime serialReadyAt;
+    private static DateTime helloSentAt;
+    private static int helloAttempts;
     private static bool serialWaiting;
+    private static bool readyReceived;
+    private static bool protocolReady;
+    private static uint pingSequence;
+    private static uint outstandingPing;
+    private static DateTime pingSentAt;
+    private static bool pingOutstanding;
+    private static int missedPongs;
+    private static int lastRttMilliseconds = -1;
+    private static long inputGeneration;
+    private static ulong inputRevision;
+    private static ulong mismatchRevision;
+    private static bool mismatchObserved;
+    private static byte expectedModifiers;
+    private static byte expectedButtons;
+    private static volatile bool syncError;
     private static IntPtr keyboardHookHandle = IntPtr.Zero;
     private static IntPtr mouseHookHandle = IntPtr.Zero;
     private static HookProc keyboardHookCallback;
     private static HookProc mouseHookCallback;
     private static System.Threading.Timer heartbeatTimer;
+    private static System.Threading.Timer windowTimer;
     private static int heartbeatActive;
+    private static int windowActive;
     private static NotifyIcon trayIcon;
     private static ContextMenuStrip trayMenu;
     private static ToolStripMenuItem statusMenuItem;
     private static ToolStripMenuItem pauseMenuItem;
+    private static ToolStripMenuItem lineageMenuItem;
     private static ToolStripMenuItem consoleMenuItem;
     private static bool consoleVisible = true;
     private static string trayStatus = "";
@@ -193,29 +229,37 @@ public static class RemoteHidBridge
     private static int mainThreadId;
     private static bool parsecMode;
     private static bool autoDetectPort;
+    private static volatile bool lineageMode;
+    private static bool lineageWindowActive;
+    private static volatile int desiredDisplayState;
+    private static int sentDisplayState = -1;
     private static volatile bool inputPaused;
     private static volatile bool inputReady;
     private static volatile bool running;
 
-    public static void Run(string portName, int baudRate, bool parsecInputMode, string iconPath, bool detectPortAutomatically)
+    public static void Run(
+        string portName,
+        int baudRate,
+        bool parsecInputMode,
+        string iconPath,
+        bool detectPortAutomatically,
+        bool lineageInputMode)
     {
         parsecMode = parsecInputMode;
         autoDetectPort = detectPortAutomatically;
+        lineageMode = lineageInputMode;
         serialPortName = portName;
         serialBaudRate = baudRate;
         mainThreadId = GetCurrentThreadId();
         keyboardHookCallback = KeyboardHook;
         mouseHookCallback = MouseHook;
+        desiredDisplayState = lineageMode ? 3 : 0;
 
         try
         {
             Log("Starting bridge on " + serialPortName + (parsecMode ? " in Parsec mode" : " in Standard mode"));
-            OpenSerial(false);
-            Thread.Sleep(2000);
-            Send("R");
-            InitializeTray(iconPath);
-            SetConnectionStatus("Connected");
             running = true;
+            InitializeTray(iconPath);
 
             commandWorker = new Thread(CommandWorker);
             commandWorker.IsBackground = true;
@@ -225,9 +269,11 @@ public static class RemoteHidBridge
             mouseHookHandle = InstallHook(WH_MOUSE_LL, mouseHookCallback);
 
             Console.CancelKeyPress += ConsoleCancel;
-            heartbeatTimer = new System.Threading.Timer(Heartbeat, null, 500, 500);
+            heartbeatTimer = new System.Threading.Timer(Heartbeat, null, 0, 500);
+            windowTimer = new System.Threading.Timer(WindowHeartbeat, null, 0, 200);
 
-            Console.WriteLine("Remote HID bridge is running on " + portName + ".");
+            Console.WriteLine("Remote HID bridge is starting on " + portName + ".");
+            Console.WriteLine("Protocol: HELLO 2 / READY 2, PING/PONG with HID state verification.");
             Console.WriteLine("Keyboard: A-Z, 0-9, arrows, F1-F12, Space, Enter, Esc, Tab, Shift, Ctrl, Alt.");
             Console.WriteLine("Mouse: cursor movement passes through; left/right/middle buttons and wheel use Arduino.");
             Console.WriteLine(parsecMode
@@ -262,25 +308,25 @@ public static class RemoteHidBridge
             {
                 heartbeatTimer.Dispose();
             }
-
+            if (windowTimer != null)
+            {
+                windowTimer.Dispose();
+            }
             if (keyboardHookHandle != IntPtr.Zero)
             {
                 UnhookWindowsHookEx(keyboardHookHandle);
                 keyboardHookHandle = IntPtr.Zero;
             }
-
             if (mouseHookHandle != IntPtr.Zero)
             {
                 UnhookWindowsHookEx(mouseHookHandle);
                 mouseHookHandle = IntPtr.Zero;
             }
-
             if (commandWorker != null)
             {
                 commandWorker.Join(2000);
                 commandWorker = null;
             }
-
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
@@ -297,7 +343,7 @@ public static class RemoteHidBridge
             {
                 try
                 {
-                    if (serial != null && serial.IsOpen && !serialWaiting)
+                    if (serial != null && serial.IsOpen && protocolReady)
                     {
                         serial.WriteLine("R");
                     }
@@ -311,6 +357,11 @@ public static class RemoteHidBridge
                 {
                     CloseSerial();
                 }
+            }
+            if (serialReader != null)
+            {
+                serialReader.Join(500);
+                serialReader = null;
             }
             Log("Bridge stopped");
         }
@@ -326,6 +377,9 @@ public static class RemoteHidBridge
         pauseMenuItem = new ToolStripMenuItem("Pause input", null, PauseMenuClick);
         trayMenu.Items.Add(pauseMenuItem);
         trayMenu.Items.Add("Reconnect", null, ReconnectMenuClick);
+        lineageMenuItem = new ToolStripMenuItem("Lineage mode", null, LineageMenuClick);
+        lineageMenuItem.Checked = lineageMode;
+        trayMenu.Items.Add(lineageMenuItem);
         consoleMenuItem = new ToolStripMenuItem("Hide console", null, ConsoleMenuClick);
         trayMenu.Items.Add(consoleMenuItem);
         trayMenu.Items.Add("Release controls", null, ReleaseMenuClick);
@@ -367,7 +421,7 @@ public static class RemoteHidBridge
 
     private static void SetConnectionStatus(string status)
     {
-        inputReady = status == "Connected";
+        inputReady = status == "Connected" && protocolReady;
         if (trayStatus == status)
         {
             return;
@@ -388,9 +442,10 @@ public static class RemoteHidBridge
 
         string mode = parsecMode ? "Parsec" : "Standard";
         string paused = inputPaused ? " | Paused" : "";
+        string rtt = lastRttMilliseconds >= 0 ? " | " + lastRttMilliseconds + " ms" : "";
         string text = "HID Bridge: " + trayStatus + paused + " (" + serialPortName + ")";
         trayIcon.Text = text.Length <= 63 ? text : text.Substring(0, 63);
-        statusMenuItem.Text = trayStatus + " | " + serialPortName + " | " + mode + paused;
+        statusMenuItem.Text = trayStatus + " | " + serialPortName + " | " + mode + paused + rtt;
     }
 
     private static void PauseMenuClick(object sender, EventArgs args)
@@ -415,6 +470,14 @@ public static class RemoteHidBridge
         }
         SetConnectionStatus("Reconnecting");
         Heartbeat(null);
+    }
+
+    private static void LineageMenuClick(object sender, EventArgs args)
+    {
+        lineageMode = !lineageMode;
+        lineageMenuItem.Checked = lineageMode;
+        lineageWindowActive = false;
+        ReleaseControls();
     }
 
     private static void ConsoleMenuClick(object sender, EventArgs args)
@@ -446,14 +509,19 @@ public static class RemoteHidBridge
         ReleaseControls();
     }
 
+    private static long CurrentGeneration()
+    {
+        return Interlocked.Read(ref inputGeneration);
+    }
+
     private static void ReleaseControls()
     {
-        EnqueueCommand("R", 0);
-
+        Interlocked.Increment(ref inputGeneration);
         lock (StateSync)
         {
             ResetInputState();
         }
+        EnqueueCommand("R", 0);
     }
 
     private static void ResetInputState()
@@ -507,27 +575,59 @@ public static class RemoteHidBridge
 
     private static void OpenSerial(bool waitForReset)
     {
-        serial = new SerialPort(serialPortName, serialBaudRate);
-        serial.NewLine = "\n";
-        serial.WriteTimeout = 1000;
-        serial.Open();
+        SerialPort newPort = new SerialPort(serialPortName, serialBaudRate);
+        newPort.NewLine = "\n";
+        newPort.DtrEnable = true;
+        newPort.RtsEnable = true;
+        newPort.WriteTimeout = 1000;
+        newPort.ReadTimeout = 250;
+        try
+        {
+            newPort.Open();
+        }
+        catch
+        {
+            newPort.Dispose();
+            throw;
+        }
+
+        serial = newPort;
         serialWaiting = waitForReset;
         serialReadyAt = DateTime.UtcNow.AddSeconds(2);
+        helloSentAt = DateTime.MinValue;
+        helloAttempts = 0;
+        readyReceived = false;
+        protocolReady = false;
+        pingOutstanding = false;
+        missedPongs = 0;
+        lastRttMilliseconds = -1;
+        sentDisplayState = -1;
+        syncError = false;
+        Interlocked.Increment(ref inputGeneration);
+
+        serialReader = new Thread(SerialReader);
+        serialReader.IsBackground = true;
+        serialReader.Start(newPort);
     }
 
     private static void CloseSerial()
     {
         serialWaiting = false;
-        if (serial == null)
+        readyReceived = false;
+        protocolReady = false;
+        pingOutstanding = false;
+        SerialPort oldPort = serial;
+        serial = null;
+        if (oldPort == null)
         {
             return;
         }
 
         try
         {
-            if (serial.IsOpen)
+            if (oldPort.IsOpen)
             {
-                serial.Close();
+                oldPort.Close();
             }
         }
         catch
@@ -535,29 +635,174 @@ public static class RemoteHidBridge
         }
         finally
         {
-            serial.Dispose();
-            serial = null;
+            oldPort.Dispose();
         }
+    }
+
+    private static bool IsCurrentPort(SerialPort port)
+    {
+        lock (SerialSync)
+        {
+            return Object.ReferenceEquals(serial, port);
+        }
+    }
+
+    private static void SerialReader(object state)
+    {
+        SerialPort readerPort = (SerialPort)state;
+        while (running && IsCurrentPort(readerPort))
+        {
+            try
+            {
+                string line = readerPort.ReadLine().Trim();
+                if (!IsCurrentPort(readerPort))
+                {
+                    return;
+                }
+                ProcessSerialLine(readerPort, line);
+            }
+            catch (TimeoutException)
+            {
+            }
+            catch (Exception error)
+            {
+                if (IsCurrentPort(readerPort))
+                {
+                    HandleConnectionError(error);
+                }
+                return;
+            }
+        }
+    }
+
+    private static void ProcessSerialLine(SerialPort readerPort, string line)
+    {
+        if (line.StartsWith("READY ", StringComparison.Ordinal))
+        {
+            string version = line.Substring(6);
+            lock (SerialSync)
+            {
+                if (!Object.ReferenceEquals(serial, readerPort) || !serialWaiting || helloAttempts == 0)
+                {
+                    return;
+                }
+                if (version == "2")
+                {
+                    readyReceived = true;
+                    return;
+                }
+            }
+            HandleProtocolMismatch(version);
+            return;
+        }
+
+        string[] parts = line.Split(' ');
+        if (parts.Length != 5 || parts[0] != "PONG")
+        {
+            return;
+        }
+
+        uint sequence;
+        byte modifiers;
+        byte buttons;
+        if (!UInt32.TryParse(parts[1], out sequence)
+            || !TryParseHexByte(parts[2], out modifiers)
+            || !TryParseHexByte(parts[3], out buttons)
+            || parts[4].Length != 12)
+        {
+            return;
+        }
+
+        byte[] keys = new byte[6];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (!TryParseHexByte(parts[4].Substring(i * 2, 2), out keys[i]))
+            {
+                return;
+            }
+        }
+        ProcessPong(readerPort, sequence, modifiers, buttons, keys);
+    }
+
+    private static bool TryParseHexByte(string text, out byte value)
+    {
+        return Byte.TryParse(
+            text,
+            System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out value);
+    }
+
+    private static void ProcessPong(
+        SerialPort readerPort,
+        uint sequence,
+        byte modifiers,
+        byte buttons,
+        byte[] keys)
+    {
+        lock (SerialSync)
+        {
+            if (!Object.ReferenceEquals(serial, readerPort)
+                || !protocolReady || !pingOutstanding || sequence != outstandingPing)
+            {
+                return;
+            }
+
+            pingOutstanding = false;
+            missedPongs = 0;
+            lastRttMilliseconds = Math.Max(0, (int)(DateTime.UtcNow - pingSentAt).TotalMilliseconds);
+            serial.WriteLine("T " + lastRttMilliseconds);
+        }
+        UpdateStatusText();
+        CompareHidState(modifiers, buttons, keys);
+    }
+
+    private static void HandleProtocolMismatch(string version)
+    {
+        string message = "Protocol mismatch: expected READY 2, received READY " + version;
+        Console.WriteLine(message);
+        Log(message);
+        Interlocked.Increment(ref inputGeneration);
+        lock (SerialSync)
+        {
+            CloseSerial();
+            reconnectAfter = DateTime.UtcNow.AddSeconds(2);
+        }
+        ResetAllState();
+        SetConnectionStatus("Protocol mismatch");
     }
 
     private static void HandleConnectionError(Exception error)
     {
         bool reportError = trayStatus == "Connected";
+        Interlocked.Increment(ref inputGeneration);
         lock (SerialSync)
         {
             CloseSerial();
             reconnectAfter = DateTime.UtcNow.AddSeconds(1);
         }
+        ResetAllState();
+        SetConnectionStatus("Reconnecting");
+        Log("Connection lost: " + error.Message);
+        if (reportError)
+        {
+            Console.WriteLine("Connection lost: " + error.Message);
+        }
+    }
+
+    private static void ResetAllState()
+    {
         lock (StateSync)
         {
             ResetInputState();
         }
-        SetConnectionStatus("Reconnecting");
-        if (reportError)
+        lock (ExpectedSync)
         {
-            Console.WriteLine("Connection lost: " + error.Message);
-            Log("Connection lost: " + error.Message);
+            ResetExpectedState();
+            mismatchObserved = false;
         }
+        syncError = false;
+        lastRttMilliseconds = -1;
     }
 
     private static IntPtr InstallHook(int hookType, HookProc callback)
@@ -584,12 +829,10 @@ public static class RemoteHidBridge
         {
             map[key] = (byte)('a' + key - 0x41);
         }
-
         for (uint key = 0x30; key <= 0x39; key++)
         {
             map[key] = (byte)key;
         }
-
         for (uint key = 0; key < 12; key++)
         {
             map[0x70 + key] = (byte)(0xC1 + key);
@@ -603,7 +846,6 @@ public static class RemoteHidBridge
         map[0x0D] = 0xB0;
         map[0x1B] = 0xB1;
         map[0x09] = 0xB3;
-
         map[0x10] = 0x81;
         map[0xA0] = 0x81;
         map[0xA1] = 0x85;
@@ -613,7 +855,6 @@ public static class RemoteHidBridge
         map[0x12] = 0x82;
         map[0xA4] = 0x82;
         map[0xA5] = 0x86;
-
         return map;
     }
 
@@ -688,7 +929,7 @@ public static class RemoteHidBridge
                     {
                         if (parsecMode)
                         {
-                            if (PressedKeys.Contains(hidCode) && !ReleasingKeys.Add(hidCode))
+                            if (!PressedKeys.Contains(hidCode) || !ReleasingKeys.Add(hidCode))
                             {
                                 return (IntPtr)1;
                             }
@@ -700,12 +941,10 @@ public static class RemoteHidBridge
                         AddPending(PendingKeyUp, hidCode);
                         EnqueueCommand("U " + hidCode, InputRandom.Next(65, 96));
                     }
-
                     return (IntPtr)1;
                 }
             }
         }
-
         return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
     }
 
@@ -790,7 +1029,6 @@ public static class RemoteHidBridge
                 }
             }
         }
-
         return CallNextHookEx(mouseHookHandle, nCode, wParam, lParam);
     }
 
@@ -800,7 +1038,6 @@ public static class RemoteHidBridge
         {
             return;
         }
-
         int count;
         pending.TryGetValue(code, out count);
         pending[code] = count + 1;
@@ -813,7 +1050,6 @@ public static class RemoteHidBridge
         {
             return false;
         }
-
         if (count == 1)
         {
             pending.Remove(code);
@@ -831,7 +1067,6 @@ public static class RemoteHidBridge
         {
             return false;
         }
-
         pending[button]--;
         return true;
     }
@@ -851,7 +1086,6 @@ public static class RemoteHidBridge
                 {
                     return;
                 }
-
                 if (serial == null)
                 {
                     if (DateTime.UtcNow < reconnectAfter)
@@ -878,19 +1112,63 @@ public static class RemoteHidBridge
                     return;
                 }
 
-                if (serialWaiting)
+                if (!protocolReady)
                 {
+                    if (readyReceived)
+                    {
+                        serial.WriteLine("R");
+                        lock (ExpectedSync)
+                        {
+                            ResetExpectedState();
+                            inputRevision++;
+                        }
+                        lock (StateSync)
+                        {
+                            ResetInputState();
+                        }
+                        Interlocked.Increment(ref inputGeneration);
+                        readyReceived = false;
+                        serialWaiting = false;
+                        protocolReady = true;
+                        pingOutstanding = false;
+                        missedPongs = 0;
+                        sentDisplayState = -1;
+                        SetConnectionStatus("Connected");
+                        return;
+                    }
+
                     if (DateTime.UtcNow < serialReadyAt)
                     {
                         return;
                     }
-                    serialWaiting = false;
-                    serial.WriteLine("R");
+                    if (helloAttempts >= 4)
+                    {
+                        throw new InvalidOperationException("READY 2 was not received; protocol handshake failed.");
+                    }
+                    if (helloAttempts == 0 || DateTime.UtcNow - helloSentAt >= TimeSpan.FromMilliseconds(500))
+                    {
+                        serial.WriteLine("HELLO 2");
+                        helloAttempts++;
+                        helloSentAt = DateTime.UtcNow;
+                        SetConnectionStatus("Waiting for READY 2");
+                    }
+                    return;
                 }
 
-                Send("H");
+                if (pingOutstanding)
+                {
+                    missedPongs++;
+                    if (missedPongs >= 2)
+                    {
+                        throw new InvalidOperationException("Two consecutive PONG responses were missed.");
+                    }
+                }
+                pingSequence++;
+                outstandingPing = pingSequence;
+                pingSentAt = DateTime.UtcNow;
+                pingOutstanding = true;
+                serial.WriteLine("PING " + pingSequence);
             }
-            SetConnectionStatus("Connected");
         }
         catch (Exception error)
         {
@@ -908,10 +1186,9 @@ public static class RemoteHidBridge
         {
             return;
         }
-
         try
         {
-            CommandQueue.Add(new BridgeCommand(command, delayMilliseconds));
+            CommandQueue.Add(new BridgeCommand(command, delayMilliseconds, CurrentGeneration()));
         }
         catch (InvalidOperationException)
         {
@@ -928,7 +1205,7 @@ public static class RemoteHidBridge
                 {
                     break;
                 }
-                if (!inputReady)
+                if (!inputReady || command.Generation != CurrentGeneration())
                 {
                     continue;
                 }
@@ -938,14 +1215,21 @@ public static class RemoteHidBridge
                 {
                     Thread.Sleep((int)Math.Ceiling(delay.TotalMilliseconds));
                 }
-                if (!running || !inputReady)
+                if (!running || !inputReady || command.Generation != CurrentGeneration())
                 {
                     continue;
                 }
 
                 try
                 {
-                    Send(command.Text);
+                    lock (SerialSync)
+                    {
+                        Send(command.Text);
+                        lock (ExpectedSync)
+                        {
+                            UpdateExpectedState(command.Text);
+                        }
+                    }
                 }
                 catch (Exception error)
                 {
@@ -963,13 +1247,263 @@ public static class RemoteHidBridge
     {
         lock (SerialSync)
         {
-            if (serial == null || !serial.IsOpen || serialWaiting)
+            if (serial == null || !serial.IsOpen)
             {
                 throw new InvalidOperationException("Serial port is not ready.");
             }
-
             serial.WriteLine(command);
         }
+    }
+
+    private static byte ProtocolToHidCode(byte code)
+    {
+        if (code >= 'a' && code <= 'z') return (byte)(0x04 + code - 'a');
+        if (code >= '1' && code <= '9') return (byte)(0x1E + code - '1');
+        if (code == '0') return 0x27;
+        if (code == ' ') return 0x2C;
+        if (code >= 0xC1 && code <= 0xCC) return (byte)(0x3A + code - 0xC1);
+        switch (code)
+        {
+            case 0xB0: return 0x28;
+            case 0xB1: return 0x29;
+            case 0xB3: return 0x2B;
+            case 0xD7: return 0x4F;
+            case 0xD8: return 0x50;
+            case 0xD9: return 0x51;
+            case 0xDA: return 0x52;
+            default: return 0;
+        }
+    }
+
+    private static void UpdateExpectedState(string command)
+    {
+        string[] parts = command.Split(' ');
+        lock (ExpectedSync)
+        {
+            if (parts[0] == "R")
+            {
+                ResetExpectedState();
+                inputRevision++;
+                return;
+            }
+            if (parts[0] == "D" || parts[0] == "U")
+            {
+                byte code = Byte.Parse(parts[1]);
+                if (code >= 0x80 && code <= 0x87)
+                {
+                    byte mask = (byte)(1 << (code - 0x80));
+                    if (parts[0] == "D") expectedModifiers |= mask;
+                    else expectedModifiers &= (byte)~mask;
+                }
+                else
+                {
+                    byte hidCode = ProtocolToHidCode(code);
+                    if (hidCode != 0)
+                    {
+                        if (parts[0] == "D") AddExpectedKey(hidCode);
+                        else RemoveExpectedKey(hidCode);
+                    }
+                }
+                inputRevision++;
+                return;
+            }
+            if (parts[0] == "B")
+            {
+                int button = Int32.Parse(parts[1]);
+                byte mask = (byte)(1 << (button - 1));
+                if (parts[2] == "1") expectedButtons |= mask;
+                else expectedButtons &= (byte)~mask;
+                inputRevision++;
+            }
+        }
+    }
+
+    private static void AddExpectedKey(byte hidCode)
+    {
+        for (int i = 0; i < ExpectedKeys.Length; i++)
+        {
+            if (ExpectedKeys[i] == hidCode) return;
+        }
+        for (int i = 0; i < ExpectedKeys.Length; i++)
+        {
+            if (ExpectedKeys[i] == 0)
+            {
+                ExpectedKeys[i] = hidCode;
+                return;
+            }
+        }
+    }
+
+    private static void RemoveExpectedKey(byte hidCode)
+    {
+        for (int i = 0; i < ExpectedKeys.Length; i++)
+        {
+            if (ExpectedKeys[i] == hidCode)
+            {
+                ExpectedKeys[i] = 0;
+                return;
+            }
+        }
+    }
+
+    private static void ResetExpectedState()
+    {
+        expectedModifiers = 0;
+        expectedButtons = 0;
+        Array.Clear(ExpectedKeys, 0, ExpectedKeys.Length);
+    }
+
+    private static void CompareHidState(byte modifiers, byte buttons, byte[] keys)
+    {
+        bool recover = false;
+        bool clearSyncError = false;
+        lock (ExpectedSync)
+        {
+            bool matches = expectedModifiers == modifiers
+                && expectedButtons == buttons
+                && KeysMatch(keys);
+            if (matches)
+            {
+                mismatchObserved = false;
+                clearSyncError = syncError;
+            }
+            else if (!mismatchObserved || mismatchRevision != inputRevision)
+            {
+                mismatchObserved = true;
+                mismatchRevision = inputRevision;
+            }
+            else
+            {
+                recover = true;
+            }
+        }
+
+        if (recover)
+        {
+            RecoverHidState();
+        }
+        else if (clearSyncError)
+        {
+            syncError = false;
+            lock (SerialSync)
+            {
+                sentDisplayState = -1;
+            }
+        }
+    }
+
+    private static bool KeysMatch(byte[] actualKeys)
+    {
+        byte[] expectedSorted = (byte[])ExpectedKeys.Clone();
+        byte[] actualSorted = (byte[])actualKeys.Clone();
+        Array.Sort(expectedSorted);
+        Array.Sort(actualSorted);
+        for (int i = 0; i < expectedSorted.Length; i++)
+        {
+            if (expectedSorted[i] != actualSorted[i]) return false;
+        }
+        return true;
+    }
+
+    private static void RecoverHidState()
+    {
+        Log("HID state mismatch; controls released.");
+        syncError = true;
+        Interlocked.Increment(ref inputGeneration);
+        lock (StateSync)
+        {
+            ResetInputState();
+        }
+        lock (SerialSync)
+        {
+            if (serial == null || !serial.IsOpen || !protocolReady)
+            {
+                return;
+            }
+            serial.WriteLine("R");
+            lock (ExpectedSync)
+            {
+                ResetExpectedState();
+                inputRevision++;
+                mismatchObserved = false;
+            }
+            serial.WriteLine("S 5");
+            sentDisplayState = 5;
+        }
+    }
+
+    private static void WindowHeartbeat(object state)
+    {
+        if (!running || Interlocked.Exchange(ref windowActive, 1) == 1)
+        {
+            return;
+        }
+        try
+        {
+            bool active = lineageMode && IsLineageWindowActive();
+            if (lineageMode && lineageWindowActive && !active)
+            {
+                ReleaseControls();
+            }
+            lineageWindowActive = active;
+            desiredDisplayState = GetDesiredDisplayState();
+
+            if (!inputReady || syncError || desiredDisplayState == sentDisplayState)
+            {
+                return;
+            }
+            lock (SerialSync)
+            {
+                if (!inputReady || syncError || serial == null || !serial.IsOpen
+                    || desiredDisplayState == sentDisplayState)
+                {
+                    return;
+                }
+                serial.WriteLine("S " + desiredDisplayState);
+                sentDisplayState = desiredDisplayState;
+            }
+        }
+        catch (Exception error)
+        {
+            HandleConnectionError(error);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref windowActive, 0);
+        }
+    }
+
+    private static int GetDesiredDisplayState()
+    {
+        if (!lineageMode) return inputPaused ? 1 : 0;
+        if (inputPaused) return 4;
+        return lineageWindowActive ? 2 : 3;
+    }
+
+    private static bool IsLineageWindowActive()
+    {
+        IntPtr window = GetForegroundWindow();
+        if (window == IntPtr.Zero) return false;
+
+        uint processId;
+        GetWindowThreadProcessId(window, out processId);
+        try
+        {
+            using (Process process = Process.GetProcessById((int)processId))
+            {
+                if (String.Equals(process.ProcessName, "l2", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        StringBuilder title = new StringBuilder(256);
+        GetWindowText(window, title, title.Capacity);
+        return title.ToString().IndexOf("Lineage", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static void ConsoleCancel(object sender, ConsoleCancelEventArgs args)
@@ -985,7 +1519,6 @@ public static class RemoteHidBridge
         {
             return;
         }
-
         running = false;
         PostThreadMessage(mainThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
     }
@@ -993,4 +1526,10 @@ public static class RemoteHidBridge
 "@
 
 Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll, System.Management.dll, System.Drawing.dll, System.Windows.Forms.dll
-[RemoteHidBridge]::Run($Port, $BaudRate, $ParsecMode.IsPresent, (Join-Path $PSScriptRoot 'bridge.ico'), $autoDetectPort)
+[RemoteHidBridge]::Run(
+    $Port,
+    $BaudRate,
+    $ParsecMode.IsPresent,
+    (Join-Path $PSScriptRoot 'bridge.ico'),
+    $autoDetectPort,
+    $LineageMode.IsPresent)

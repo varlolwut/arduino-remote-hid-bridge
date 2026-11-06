@@ -24,9 +24,16 @@ The COM port is detected automatically. To specify it explicitly:
 windows\start-parsec-hid-bridge.cmd COM7
 ```
 
-The tray menu shows the connection state, COM port and mode. **Pause input** releases all controls and stops forwarding until resumed; **Reconnect** detects the Arduino COM port again and restarts the connection. **Hide/Show console** controls the log window. **Release controls** is also available on double-click. If Arduino disconnects, input passes directly to Windows until the bridge reconnects.
+The tray menu shows the connection state, COM port, mode and RTT. **Pause input** releases all controls and stops forwarding until resumed; **Reconnect** detects the Arduino COM port again and restarts the connection. **Lineage mode** tracks the game window and releases controls on focus loss. **Hide/Show console** controls the log window. **Release controls** is also available on double-click. If Arduino disconnects, input passes directly to Windows until the bridge reconnects.
 
-Input hooks only update state and enqueue commands; serial writes and delays run on a separate thread so they cannot block Windows input. Presses are forwarded immediately, while key and mouse-button releases use a small randomized 65–95 ms delay. Individual keys are not logged. Connection, pause and error events are stored in `%LOCALAPPDATA%\RemoteHidBridge\bridge.log` (rotated at 256 KB).
+Input hooks only update state and enqueue commands. Serial writes and delays run on a separate thread; responses are read by another thread, so neither can block Windows input. Presses are forwarded immediately, while key and mouse-button releases use a small randomized 65–95 ms delay. Individual keys are not logged. Connection, pause and error events are stored in `%LOCALAPPDATA%\RemoteHidBridge\bridge.log` (rotated at 256 KB).
+
+## Protocol and recovery
+
+- The host and firmware must both use protocol v2. `Connected` is set only after `HELLO 2` receives `READY 2`, followed by an initial `R`.
+- `PING` is sent every 500 ms. RTT is measured from the matching `PONG`; late and duplicate responses are ignored. Two missed responses trigger reconnect.
+- Each `PONG` reports modifiers, mouse buttons and six keyboard slots. A persistent mismatch sends `R`, invalidates queued input and logs `HID state mismatch; controls released.` Held keys are not replayed.
+- Reconnect, focus loss, pause and manual release invalidate older queued commands. The firmware releases controls autonomously after 2000 ms without valid commands.
 
 ## Stop the bridge
 
@@ -36,7 +43,9 @@ Input hooks only update state and enqueue commands; serial writes and delays run
 
 ## Optional OLED
 
-A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or `0x3D`. Connect SDA to D2, SCL to D3, GND to GND, and VCC according to the display module. It shows the link state and last input event. No display or external display library is required.
+A 0.91-inch SSD1306 128×32 I²C display is detected automatically at `0x3C` or `0x3D`. Connect SDA to D2, SCL to D3, GND to GND, and VCC according to the display module. No external display library is required, and operation without a display is unchanged.
+
+The four rows show `REMOTE HID`, the HID/Lineage window state, link/RTT state, and input state (`INPUT OK`, `INPUT HOLD`, `PAUSED`, `SYNC ERROR` or `RELEASE ALL`). Key names and key codes are never displayed.
 
 ## 3D-printed enclosure
 
