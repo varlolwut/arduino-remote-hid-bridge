@@ -49,7 +49,7 @@ The four rows show `REMOTE HID`, the HID/Lineage window state, link/RTT state, a
 
 ## 3D-printed enclosure
 
-`enclosure/RemoteHID_v19_plate.3mf` contains the Pro Micro enclosure with an OLED window. Open the 3MF project in your slicer and check the dimensions and print settings before printing.
+`enclosure/RemoteHID_v19_plate.3mf` contains the Pro Micro enclosure with an OLED window. Pro Micro boards and OLED modules vary slightly in dimensions and component placement, so a perfect fit cannot be guaranteed. Measure your hardware, then check the dimensions and print settings in your slicer before printing.
 
 ## Supported input
 
