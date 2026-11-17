@@ -49,7 +49,7 @@ The four rows show `REMOTE HID`, the HID/Lineage window state, link/RTT state, a
 
 ## 3D-printed enclosure
 
-`enclosure/` contains a base and lid for a typical 34×18 mm Pro Micro. The 42×26 mm case has a micro-USB cable notch and side/lid ventilation slots. Print both parts without supports: base upright, lid with its outer face on the bed. Measure your board before printing.
+`enclosure/RemoteHID_v19_plate.3mf` contains the Pro Micro enclosure with an OLED window. Open the 3MF project in your slicer and check the dimensions and print settings before printing.
 
 ## Supported input
 
@@ -62,5 +62,5 @@ The four rows show `REMOTE HID`, the HID/Lineage window state, link/RTT state, a
 - `windows/remote-hid-bridge.ps1` — captures remote input, forwards it to the Arduino and manages the tray icon.
 - `windows/start-hid-bridge.cmd` — standard mode for RustDesk; captures injected remote input.
 - `windows/start-parsec-hid-bridge.cmd` — Parsec/Moonlight mode; captures virtual HID input and filters out Arduino echo.
-- `enclosure/` — printable base and lid STL files.
+- `enclosure/` — 3MF enclosure project with an OLED window.
 - `assets/` — repository logo and social preview.
